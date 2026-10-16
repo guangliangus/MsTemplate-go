@@ -38,10 +38,11 @@ tar -C "$TEMPLATE_DIR" --exclude .git --exclude bin --exclude dist --exclude '*.
 
 cd "$DEST"
 
-# 1. the module path in go.mod and every import
+# 1. the module path in go.mod and every import. Only the whole path: one that runs on from a host
+#    name (registry.example.com/msvcservice, the chart's image) is not the module and is left alone.
 go mod edit -module "$MODULE"
 grep -rl --exclude-dir=.git "$OLD_MODULE" . | while read -r f; do
-  perl -pi -e "s#\Q$OLD_MODULE\E#$MODULE#g" "$f"
+  perl -pi -e "s#(?<![A-Za-z0-9.-])\Q$OLD_MODULE\E#$MODULE#g" "$f"
 done
 
 # 2. the service name tokens: directories first, then file contents
