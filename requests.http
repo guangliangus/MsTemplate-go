@@ -1,0 +1,95 @@
+### msvcservice — walk the reference order flow (VS Code REST Client / JetBrains HTTP client).
+### Local runs need no token: the development overlay accepts header identities.
+@host = http://localhost:8080
+# probes and /metrics live on the admin listener, not on the API
+@admin = http://localhost:8081
+@consumer = X-Dev-Subject: 1
+@realm = X-Dev-Realm: CONSUMER
+
+### probes & metrics (admin listener)
+GET {{admin}}/health/startup
+###
+GET {{admin}}/health/live
+###
+GET {{admin}}/health/ready
+###
+GET {{admin}}/metrics
+
+### unauthenticated → 401 problem details
+GET {{host}}/api/v1/orders
+
+### create an order (the inventory service prices it via WireMock → outbox → RabbitMQ → consumer confirms it)
+### there is no unitPrice in the request: prices are never the client's to state
+# @name create
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+{{consumer}}
+{{realm}}
+Idempotency-Key: demo-0001
+
+{ "items": [ { "sku": "SKU-1", "quantity": 2 } ] }
+
+### same key again → replayed response, Idempotency-Replayed: true
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+{{consumer}}
+{{realm}}
+Idempotency-Key: demo-0001
+
+{ "items": [ { "sku": "SKU-1", "quantity": 2 } ] }
+
+### read it back (cached) — status flips to CONFIRMED once the consumer ran
+GET {{host}}/api/v1/orders/{{create.response.body.id}}
+{{consumer}}
+{{realm}}
+
+### my orders, paged
+GET {{host}}/api/v1/orders?page=1&pageSize=10
+{{consumer}}
+{{realm}}
+
+### validation → 400 VALIDATION_FAILED with the errors map
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+{{consumer}}
+{{realm}}
+
+{ "items": [ { "sku": "", "quantity": 0 } ] }
+
+### business rule → 422 ORDER_ITEM_UNAVAILABLE (WireMock stub)
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+{{consumer}}
+{{realm}}
+
+{ "items": [ { "sku": "OUT-OF-STOCK", "quantity": 1 } ] }
+
+### downstream fault → 502 UPSTREAM_SERVICE_UNAVAILABLE (and the breaker opens after 5 in a row)
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+{{consumer}}
+{{realm}}
+
+{ "items": [ { "sku": "FAULT", "quantity": 1 } ] }
+
+### cancel a CONFIRMED order → 409 ORDER_NOT_CANCELLABLE
+DELETE {{host}}/api/v1/orders/{{create.response.body.id}}
+{{consumer}}
+{{realm}}
+
+### wrong plane → 403 (a back-office identity on a consumer route)
+GET {{host}}/api/v1/orders
+X-Dev-Subject: 1
+X-Dev-Realm: BACKOFFICE
+X-Dev-Scopes: orders.read
+
+### back office: every customer's orders, newest first, by cursor (needs the orders.read scope);
+### pass the response's nextCursor as ?cursor= for the next page
+GET {{host}}/api/v1/backoffice/orders?limit=5
+X-Dev-Subject: 7
+X-Dev-Realm: BACKOFFICE
+X-Dev-Scopes: orders.read
+
+### a real token, minted like user-svc's: tools/mint-dev-token.sh --sub 1 --realm CONSUMER
+GET {{host}}/api/v1/orders
+Authorization: Bearer <paste the token here>

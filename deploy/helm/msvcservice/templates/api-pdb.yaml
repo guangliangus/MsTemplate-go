@@ -1,0 +1,13 @@
+{{- if and .Values.api.enabled .Values.api.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "msvc.fullname" . }}-api
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "msvc.api.selectorLabels" . | nindent 6 }}
+{{- end }}

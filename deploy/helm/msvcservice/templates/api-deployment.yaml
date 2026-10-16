@@ -1,0 +1,40 @@
+{{- if .Values.api.enabled }}
+{{- $extra := dict }}
+{{- if .Values.worker.enabled }}
+{{- $_ := set $extra "TASKS__MAX_WORKERS" "0" }}
+{{- $_ := set $extra "RABBITMQ__CONSUMERS_ENABLED" "false" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "msvc.fullname" . }}-api
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.hpa.enabled }}
+  replicas: {{ .Values.api.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "msvc.api.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "msvc.api.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "msvc.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          {{- include "msvc.container" (dict "root" . "command" "serve" "port" .Values.api.port "resources" .Values.api.resources "extraEnv" $extra) | nindent 10 }}
+{{- end }}

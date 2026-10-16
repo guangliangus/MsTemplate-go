@@ -1,0 +1,279 @@
+# CI/CD for msvcservice.
+# Prereqs: a Docker registry service connection (containerRegistry) and Kubernetes service
+# connections (k8sConnectionDev / k8sConnectionProd) configured in the Azure DevOps project, plus a
+# CiDatabaseUrl pipeline variable (a libpq URI to a throwaway PostgreSQL) for the DDL gate.
+
+trigger:
+  branches:
+    include: [main]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  goVersion: "1.27"
+  # Tool versions are pinned (Renovate bumps them, see renovate.json); install scripts are fetched
+  # from the SAME tag they install, never from a moving branch. The Go tools (gotestsum,
+  # gocover-cobertura, govulncheck) are pinned in tools/go.mod instead.
+  # renovate: datasource=github-releases depName=golangci/golangci-lint
+  golangciLintVersion: v2.14.0
+  # renovate: datasource=github-releases depName=aquasecurity/trivy
+  trivyVersion: v0.75.0
+  # Helm 3: Helm 4 deprecates the deploy step's --atomic (now --rollback-on-failure); move both together.
+  # renovate: datasource=github-releases depName=helm/helm
+  helmVersion: v3.22.0
+  securityScan: true
+  containerRegistry: my-registry-connection
+  registryHost: registry.example.com
+  imageName: msvcservice
+  imageTag: $(Build.BuildNumber)
+  helmReleaseName: msvcservice
+  buildWorker: false # flip to true for a service with its own worker deployment
+  k8sConnectionDev: my-k8s-connection-dev
+  k8sConnectionProd: my-k8s-connection
+  helmNamespaceDev: services-dev
+  helmNamespaceProd: services
+  # Lark/Feishu group webhook for deploy notifications; keep it in a variable group as a secret
+  # variable and map it here. Empty skips the notification steps.
+  notifyWebhookUrl: ""
+
+stages:
+  - stage: Build
+    displayName: Build & test
+    jobs:
+      - job: build
+        steps:
+          - task: GoTool@0
+            displayName: Pin Go
+            inputs:
+              version: $(goVersion)
+
+          - script: go mod download
+            displayName: go mod download
+
+          - script: go build ./... && go vet ./...
+            displayName: go build + vet
+
+          - script: |
+              set -e
+              curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/$(golangciLintVersion)/install.sh" \
+                | sh -s -- -b "$(go env GOPATH)/bin" "$(golangciLintVersion)"
+              "$(go env GOPATH)/bin/golangci-lint" run ./...
+            displayName: golangci-lint
+
+          # gotestsum writes the JUnit file the Tests tab reads; coverage goes to the Coverage tab as
+          # Cobertura. Both publish on failure too, so a red run shows WHICH test, not just red.
+          - script: |
+              set -e
+              go tool -modfile=tools/go.mod gotestsum --junitfile "$(Build.ArtifactStagingDirectory)/unit.xml" --format testname -- \
+                -race -count=1 -coverprofile=coverage.txt -covermode=atomic ./...
+              go tool -modfile=tools/go.mod gocover-cobertura < coverage.txt > "$(Build.ArtifactStagingDirectory)/coverage.xml"
+            displayName: unit tests (plus the architecture and DDL guards)
+
+          # Integration tests use Testcontainers; the agent has Docker. CI=true turns a silent
+          # "no Docker, skipping" into a failure, so a green run always proves something.
+          - script: |
+              set -e
+              go tool -modfile=tools/go.mod gotestsum --junitfile "$(Build.ArtifactStagingDirectory)/integration.xml" --format testname -- \
+                -race -count=1 -tags=integration -timeout 20m ./tests/... ./pkg/...
+            displayName: integration tests (Testcontainers)
+            env:
+              CI: "true"
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "$(Build.ArtifactStagingDirectory)/*.xml"
+              mergeTestResults: true
+              testRunTitle: $(imageName)
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish coverage
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: $(Build.ArtifactStagingDirectory)/coverage.xml
+
+          # Supply chain: the Go vulnerability database against the exact module graph.
+          - script: go tool -modfile=tools/go.mod govulncheck ./...
+            displayName: govulncheck
+
+          # DDL gate: every db/*.sql is applied twice; the second pass must succeed with no side
+          # effects, which is what "idempotent, re-runnable by hand" means in practice.
+          - script: |
+              set -e
+              for f in db/*.sql; do
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+              done
+            displayName: DDL idempotency (run twice)
+            env:
+              DATABASE_URL: $(CiDatabaseUrl)
+
+  - stage: Package
+    displayName: Docker build, scan & push
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: docker
+        steps:
+          - task: Docker@2
+            displayName: Registry login
+            inputs:
+              command: login
+              containerRegistry: $(containerRegistry)
+
+          - task: Docker@2
+            displayName: Build & push image
+            inputs:
+              command: buildAndPush
+              containerRegistry: $(containerRegistry)
+              repository: $(imageName)
+              dockerfile: Dockerfile
+              buildContext: .
+              arguments: --build-arg VERSION=$(imageTag)
+              tags: |
+                $(imageTag)
+
+          # Failing the scan blocks the Deploy stage. The tag already exists in the registry at
+          # that point — it just never ships; rebuild with patched bases to clear it.
+          - script: |
+              set -e
+              curl -sSfL "https://raw.githubusercontent.com/aquasecurity/trivy/$(trivyVersion)/contrib/install.sh" \
+                | sh -s -- -b "$(Agent.TempDirectory)/trivy-bin" "$(trivyVersion)"
+              export PATH="$(Agent.TempDirectory)/trivy-bin:$PATH"
+              mkdir -p "$(Build.ArtifactStagingDirectory)/sbom"
+              image="$(registryHost)/$(imageName):$(imageTag)"
+              trivy image --format cyclonedx --output "$(Build.ArtifactStagingDirectory)/sbom/$(imageName).cdx.json" "$image"
+              trivy image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL "$image"
+            displayName: Trivy image scan + SBOM (HIGH/CRITICAL fail)
+            condition: and(succeeded(), eq(variables.securityScan, 'true'))
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish SBOM
+            condition: and(succeeded(), eq(variables.securityScan, 'true'))
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/sbom
+              ArtifactName: sbom
+
+  # Environments are Helm value overlays: values.yaml (safe baseline) + values.{env}.yaml
+  # (differences only). Dev deploys automatically; production waits for the approval check on
+  # the 'production' environment (Azure DevOps → Environments → production → Approvals).
+  - stage: DeployDev
+    displayName: Helm deploy (dev)
+    dependsOn: Package
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: deploy_dev
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: HelmInstaller@1
+                  inputs:
+                    helmVersionToInstall: $(helmVersion)
+                - script: |
+                    set -e
+                    helm lint deploy/helm/msvcservice
+                    for env in dev prod; do
+                      helm template $(helmReleaseName) deploy/helm/msvcservice \
+                        -f deploy/helm/msvcservice/values.$env.yaml \
+                        --set image.repository=$(registryHost)/$(imageName) --set image.tag=$(imageTag) \
+                        --set worker.enabled=$(buildWorker) > /dev/null
+                    done
+                  displayName: helm lint & template (both overlays)
+                - task: HelmDeploy@1
+                  displayName: helm upgrade (dev)
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceConnection: $(k8sConnectionDev)
+                    namespace: $(helmNamespaceDev)
+                    command: upgrade
+                    chartType: FilePath
+                    chartPath: deploy/helm/msvcservice
+                    releaseName: $(helmReleaseName)
+                    arguments: >-
+                      --install --atomic --timeout 5m
+                      -f deploy/helm/msvcservice/values.dev.yaml
+                      --set image.repository=$(registryHost)/$(imageName) --set image.tag=$(imageTag)
+                      --set worker.enabled=$(buildWorker)
+                - script: |
+                    set -e
+                    status="$JOB_STATUS"; emoji="✅"; template="green"; result="发布成功"
+                    if [ "$status" != "Succeeded" ]; then emoji="❌"; template="red"; result="发布失败"; fi
+                    pipeline_url="$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    content="**服务：** $(imageName)\n**环境：** $ENV_NAME\n**版本：** $(imageTag)\n**提交：** ${BUILD_SOURCEVERSION:0:8} $(Build.SourceVersionMessage)\n**发布人：** $(Build.RequestedFor)"
+                    payload=$(python3 - "$emoji $(imageName) $result [$ENV_NAME]" "$template" "$content" "$pipeline_url" <<'PYEOF'
+                    import json, sys
+                    title, template, content, url = sys.argv[1:5]
+                    print(json.dumps({"msg_type": "interactive", "card": {"schema": "2.0",
+                      "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+                      "body": {"elements": [{"tag": "markdown", "content": content.replace("\\n", "\n")},
+                        {"tag": "button", "text": {"tag": "plain_text", "content": "查看 Pipeline"}, "multi_url": {"url": url}}]}}},
+                      ensure_ascii=False))
+                    PYEOF
+                    )
+                    curl -sS --fail-with-body -X POST "$NOTIFY_WEBHOOK_URL" -H 'Content-Type: application/json' --data "$payload"
+                  displayName: Notify (Lark/Feishu)
+                  condition: and(always(), ne(variables['notifyWebhookUrl'], ''))
+                  env:
+                    NOTIFY_WEBHOOK_URL: $(notifyWebhookUrl)
+                    JOB_STATUS: $(Agent.JobStatus)
+                    ENV_NAME: dev
+
+  - stage: DeployProd
+    displayName: Helm deploy (production)
+    dependsOn: DeployDev
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: deploy_prod
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: HelmInstaller@1
+                  inputs:
+                    helmVersionToInstall: $(helmVersion)
+                - task: HelmDeploy@1
+                  displayName: helm upgrade (production)
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceConnection: $(k8sConnectionProd)
+                    namespace: $(helmNamespaceProd)
+                    command: upgrade
+                    chartType: FilePath
+                    chartPath: deploy/helm/msvcservice
+                    releaseName: $(helmReleaseName)
+                    arguments: >-
+                      --install --atomic --timeout 5m
+                      -f deploy/helm/msvcservice/values.prod.yaml
+                      --set image.repository=$(registryHost)/$(imageName) --set image.tag=$(imageTag)
+                      --set worker.enabled=$(buildWorker)
+                - script: |
+                    set -e
+                    status="$JOB_STATUS"; emoji="✅"; template="green"; result="发布成功"
+                    if [ "$status" != "Succeeded" ]; then emoji="❌"; template="red"; result="发布失败"; fi
+                    pipeline_url="$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    content="**服务：** $(imageName)\n**环境：** $ENV_NAME\n**版本：** $(imageTag)\n**提交：** ${BUILD_SOURCEVERSION:0:8} $(Build.SourceVersionMessage)\n**发布人：** $(Build.RequestedFor)"
+                    payload=$(python3 - "$emoji $(imageName) $result [$ENV_NAME]" "$template" "$content" "$pipeline_url" <<'PYEOF'
+                    import json, sys
+                    title, template, content, url = sys.argv[1:5]
+                    print(json.dumps({"msg_type": "interactive", "card": {"schema": "2.0",
+                      "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+                      "body": {"elements": [{"tag": "markdown", "content": content.replace("\\n", "\n")},
+                        {"tag": "button", "text": {"tag": "plain_text", "content": "查看 Pipeline"}, "multi_url": {"url": url}}]}}},
+                      ensure_ascii=False))
+                    PYEOF
+                    )
+                    curl -sS --fail-with-body -X POST "$NOTIFY_WEBHOOK_URL" -H 'Content-Type: application/json' --data "$payload"
+                  displayName: Notify (Lark/Feishu)
+                  condition: and(always(), ne(variables['notifyWebhookUrl'], ''))
+                  env:
+                    NOTIFY_WEBHOOK_URL: $(notifyWebhookUrl)
+                    JOB_STATUS: $(Agent.JobStatus)
+                    ENV_NAME: production

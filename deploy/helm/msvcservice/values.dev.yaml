@@ -1,0 +1,21 @@
+# Dev overlay — apply AFTER the base file (helm deep-merges maps, so ONLY differences belong here):
+#   helm upgrade --install <release> deploy/helm/msvcservice -f deploy/helm/msvcservice/values.dev.yaml
+config:
+  APP_ENV: development
+  TELEMETRY__TRACE_SAMPLE_RATIO: "1.0"
+
+api:
+  replicas: 1
+  hpa: { enabled: false }
+  pdb: { enabled: false }
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+worker:
+  replicas: 1
+  hpa: { enabled: false }
+  pdb: { enabled: false }
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }

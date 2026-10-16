@@ -1,0 +1,13 @@
+{{- if and .Values.worker.enabled .Values.worker.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "msvc.fullname" . }}-worker
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.worker.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "msvc.worker.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -1,0 +1,18 @@
+{{- if .Values.worker.enabled }}
+# Service for the worker: only the metrics scrape uses it (the worker has no API listener).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "msvc.fullname" . }}-worker
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "msvc.worker.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: admin
+      port: {{ .Values.adminPort }}
+      targetPort: admin
+{{- end }}

@@ -1,0 +1,11 @@
+apiVersion: v2
+name: msvcservice
+description: >-
+  Deploys one microservice built from the Go msvc template: an API deployment and/or a worker
+  deployment of the same image, probes aligned with the shared health endpoints, HPA/PDB,
+  optional KEDA scaling for the worker, and optional ServiceMonitor/Ingress/NetworkPolicy.
+  Database DDL is applied by hand from the service's db/ scripts before deploying — the chart
+  never migrates.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

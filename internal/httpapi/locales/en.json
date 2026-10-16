@@ -1,0 +1,8 @@
+{
+  "ORDER_ITEMS_REQUIRED": "Add at least one item.",
+  "ORDER_ITEM_INVALID": "An item is invalid.",
+  "ORDER_ITEM_UNAVAILABLE": "An item is out of stock.",
+  "ORDER_NOT_PENDING": "The order is no longer pending.",
+  "ORDER_NOT_CANCELLABLE": "This order cannot be cancelled.",
+  "ORDER_TOTAL_TOO_LARGE": "The order total is too large; split it into smaller orders."
+}

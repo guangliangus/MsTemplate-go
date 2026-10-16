@@ -1,0 +1,36 @@
+{{- if and .Values.worker.enabled .Values.worker.keda.enabled }}
+# Scales the worker on queue depth. Requires KEDA; the AMQP connection string comes from the
+# release Secret under .Values.worker.keda.amqpConnectionSecretKey.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "msvc.fullname" . }}-rabbitmq
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: {{ include "msvc.fullname" . }}-secrets
+      key: {{ .Values.worker.keda.amqpConnectionSecretKey }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "msvc.fullname" . }}-worker
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "msvc.fullname" . }}-worker
+  minReplicaCount: {{ .Values.worker.keda.minReplicas }}
+  maxReplicaCount: {{ .Values.worker.keda.maxReplicas }}
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        queueName: {{ .Values.worker.keda.queueName | quote }}
+        mode: QueueLength
+        value: {{ .Values.worker.keda.queueLength | quote }}
+      authenticationRef:
+        name: {{ include "msvc.fullname" . }}-rabbitmq
+{{- end }}

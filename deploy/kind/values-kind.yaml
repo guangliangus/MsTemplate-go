@@ -1,0 +1,24 @@
+# Values for the kind smoke test: local image, one replica, in-cluster dependencies.
+image:
+  repository: msvcservice
+  tag: smoke
+  pullPolicy: Never
+config:
+  APP_ENV: development
+  REDIS__ADDR: redis:6379
+  TELEMETRY__OTLP_ENDPOINT: ""
+  SERVICE_CLIENTS__INVENTORY__BASE_URL: http://wiremock:8080/
+secret:
+  values:
+    POSTGRES__DSN: postgres://msvc:msvc@postgres:5432/msvcservice?sslmode=disable
+    RABBITMQ__URL: amqp://guest:guest@rabbitmq:5672/
+    AUTH__SIGNING_KEY: ZGV2LW9ubHktYWNjZXNzLXRva2VuLWtleS0zMmJ5dGU=
+api:
+  replicas: 1
+  hpa: { enabled: false }
+  pdb: { enabled: false }
+worker:
+  enabled: true
+  replicas: 1
+  hpa: { enabled: false }
+  pdb: { enabled: false }

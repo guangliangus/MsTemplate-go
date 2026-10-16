@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Keeps every pin moving through reviewable PRs: Go modules (service and tools/go.mod), base image digests, the pipeline's tool versions. A release must be two weeks old before it is proposed.",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests"
+  ],
+  "minimumReleaseAge": "14 days",
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions in azure-pipelines.yml marked with a '# renovate:' comment",
+      "managerFilePatterns": [
+        "/^azure-pipelines\\.yml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+: (?<currentValue>\\S+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Helm 4 deprecates the deploy step's --atomic (--rollback-on-failure): stay on Helm 3 until the pipeline moves",
+      "matchPackageNames": [
+        "helm/helm"
+      ],
+      "allowedVersions": "<4"
+    }
+  ]
+}

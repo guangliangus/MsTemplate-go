@@ -1,0 +1,8 @@
+{
+  "ORDER_ITEMS_REQUIRED": "商品を1つ以上追加してください",
+  "ORDER_ITEM_INVALID": "商品情報が無効です",
+  "ORDER_ITEM_UNAVAILABLE": "商品の在庫が不足しています",
+  "ORDER_NOT_PENDING": "注文の状態が変更されました",
+  "ORDER_NOT_CANCELLABLE": "この注文はキャンセルできません",
+  "ORDER_TOTAL_TOO_LARGE": "注文金額が上限を超えています。注文を分けてください"
+}

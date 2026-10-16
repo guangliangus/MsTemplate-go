@@ -1,0 +1,43 @@
+{
+  "mappings": [
+    {
+      "priority": 1,
+      "request": { "method": "GET", "urlPathPattern": "/inventory/OUT-OF-STOCK/availability" },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "available": false }
+      }
+    },
+    {
+      "priority": 1,
+      "request": { "method": "GET", "urlPathPattern": "/inventory/FAULT/availability" },
+      "response": { "fault": "CONNECTION_RESET_BY_PEER" }
+    },
+    {
+      "priority": 1,
+      "request": { "method": "GET", "urlPathPattern": "/inventory/SLOW/availability" },
+      "response": {
+        "status": 200,
+        "fixedDelayMilliseconds": 8000,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "available": true, "unitPrice": 19.99 }
+      }
+    },
+    {
+      "priority": 1,
+      "request": { "method": "GET", "urlPathPattern": "/inventory/UNKNOWN/availability" },
+      "response": { "status": 404 }
+    },
+    {
+      "priority": 10,
+      "request": { "method": "GET", "urlPathPattern": "/inventory/[^/]+/availability" },
+      "response": {
+        "status": 200,
+        "fixedDelayMilliseconds": 30,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "available": true, "unitPrice": 19.99 }
+      }
+    }
+  ]
+}

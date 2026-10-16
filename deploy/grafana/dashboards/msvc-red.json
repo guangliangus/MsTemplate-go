@@ -1,0 +1,501 @@
+{
+  "title": "msvc service — RED, messaging, tasks",
+  "uid": "msvc-red",
+  "schemaVersion": 39,
+  "tags": [
+    "msvc"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "DS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        }
+      },
+      {
+        "name": "job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS}"
+        },
+        "query": "label_values(http_server_request_duration_seconds_count, job)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Request rate (req/s)",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Error rate (5xx share)",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\",http_response_status_code=~\"5..\"}[5m])) / sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Latency p50 / p95 / p99",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (job, le) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p50 {{job}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (job, le) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p95 {{job}}"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (job, le) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p99 {{job}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Requests by route and status",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route, http_response_status_code) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{http_route}} {{http_response_status_code}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Outbox pending",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (job) (msvc_messaging_outbox_pending{job=~\"$job\"})",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Messages consumed by outcome",
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue, outcome) (rate(msvc_messaging_consumed_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{queue}} {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Task queue depth",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue) (msvc_tasks_queue_depth{job=~\"$job\"})",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Tasks completed / retried / dead",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue) (rate(msvc_tasks_completed_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "completed {{queue}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (queue) (rate(msvc_tasks_retried_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "retried {{queue}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (queue) (rate(msvc_tasks_dead_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "dead {{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Circuit breaker transitions",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (breaker, to) (increase(msvc_resilience_breaker_state_changes_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{breaker}} → {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Go runtime: goroutines / heap",
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "go_goroutines{job=~\"$job\"}",
+          "legendFormat": "goroutines {{job}}"
+        },
+        {
+          "refId": "B",
+          "expr": "go_memstats_heap_alloc_bytes{job=~\"$job\"}",
+          "legendFormat": "heap {{job}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "DB pool: acquired / idle / max",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (pgxpool_acquired_connections{job=~\"$job\"})",
+          "legendFormat": "acquired {{job}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (job) (pgxpool_idle_connections{job=~\"$job\"})",
+          "legendFormat": "idle {{job}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (job) (pgxpool_max_connections{job=~\"$job\"})",
+          "legendFormat": "max {{job}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "DB pool waits and slow queries (/s)",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (rate(pgxpool_empty_acquire_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "pool waits {{job}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (job, logged) (rate(msvc_db_slow_queries_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "slow queries logged={{logged}} {{job}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Oldest pending age: tasks and outbox",
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue) (msvc_tasks_oldest_pending_age_seconds{job=~\"$job\"})",
+          "legendFormat": "task {{queue}}"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (job) (msvc_messaging_outbox_oldest_pending_age_seconds{job=~\"$job\"})",
+          "legendFormat": "outbox {{job}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "HTTP problems by error code (/s)",
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (error_code) (rate(msvc_http_problems_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{error_code}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (queue, reason) (rate(msvc_messaging_dead_lettered_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "dead-lettered {{queue}} {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "text",
+      "title": "指标速查（与 deploy/grafana/README.md 同步维护）",
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 24,
+        "h": 12
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "| 指标 | 类型 | 标签 | 怎么读 |\n|---|---|---|---|\n| `http_server_request_duration_seconds` | histogram | `http_route`, `http_response_status_code` | RED 三件套的来源（otelhttp） |\n| `msvc_http_problems_total` | counter | `http_route`, `http_response_status_code`, `error_code` | 失败按错误码，告警可只盯一个码 |\n| `msvc_messaging_outbox_pending` / `_oldest_pending_age_seconds` | gauge | `job` | 每个副本报同一个全局值：**max**，不要 sum |\n| `msvc_messaging_consumed_total` | counter | `queue`, `outcome` | ok / duplicate / retry / dead_letter / requeued |\n| `msvc_messaging_dead_lettered_total` | counter | `queue`, `reason` | exhausted 才告警，non_retryable 是日常噪声 |\n| `msvc_tasks_queue_depth` / `_oldest_pending_age_seconds` | gauge | `queue` | **max**，不要 sum |\n| `msvc_tasks_completed_total` / `_retried_total` / `_dead_total{reason}` / `_reclaimed_total` / `_misfired_total` | counter | `queue` | dead 的 reason：exhausted / discarded |\n| `pgxpool_acquired_connections` / `_idle_connections` / `_max_connections` | gauge | `db_client_connection_pool_name` | acquired 贴着 max = 池满 |\n| `pgxpool_empty_acquire_total` / `_empty_acquire_wait_time_nanoseconds_total` | counter | | 排队次数与排队时长；慢 SQL 的 elapsed 不含这段 |\n| `msvc_db_slow_queries_total` | counter | `logged` | logged=false 是被限速吞掉的行，总量两者相加 |\n| `msvc_resilience_breaker_state_changes_total` | counter | `breaker`, `to` | to=open 即下游被熔断 |\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+# Applied on top of default.yaml when APP_ENV=development (the default for `go run`).
+http:
+  docs_enabled: true
+
+logging:
+  level: debug
+  format: text
+
+auth:
+  # The throwaway key user-svc ships in ITS development settings ("dev-only-access-token-key-32byte"),
+  # so a token from a locally running user-svc — or one minted by tools/mint-dev-token.sh —
+  # validates here with no setup. It is in the repository, so it is not a secret, which is exactly
+  # why production supplies AUTH__SIGNING_KEY from a Secret.
+  signing_key: ZGV2LW9ubHktYWNjZXNzLXRva2VuLWtleS0zMmJ5dGU=
+  # Header identities for `go run` + curl: -H 'X-Dev-Subject: 1' -H 'X-Dev-Realm: CONSUMER'.
+  # Refused outside the development environment even if set.
+  dev_headers:
+    enabled: true

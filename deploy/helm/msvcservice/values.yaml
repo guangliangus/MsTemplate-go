@@ -1,0 +1,177 @@
+# Values for one msvc service. The API and the worker are two deployments of ONE image, told
+# apart by the container command (serve / worker). This file is the production-safe baseline;
+# values.dev.yaml and values.prod.yaml carry only differences.
+
+nameOverride: ""
+
+image:
+  repository: registry.example.com/msvcservice
+  tag: "" # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Non-secret configuration → ConfigMap, injected via envFrom. Keys are SECTION__KEY.
+config:
+  APP_ENV: production
+  LOGGING__FORMAT: json
+  # Head-sample traces in production ("0.1" = 10%); 1.0 records everything.
+  TELEMETRY__TRACE_SAMPLE_RATIO: "1.0"
+  TELEMETRY__OTLP_ENDPOINT: http://otel-collector.observability:4317
+  REDIS__ADDR: redis:6379
+  # The platform's user service issues every token (HS256); this service validates them locally
+  # against the same key. The key is a secret and lives under `secret.values` as AUTH__SIGNING_KEY.
+  AUTH__ISSUER: user-svc
+  # AUTH__AUDIENCE is deliberately NOT set: user-svc tokens carry no aud.
+  # Pods sit behind the ingress: honour X-Forwarded-For. With no trusted proxies configured every
+  # source is trusted; set the pod CIDR to restrict: HTTP__FORWARDED_HEADERS__TRUSTED_PROXIES: "10.0.0.0/8"
+  HTTP__FORWARDED_HEADERS__ENABLED: "true"
+  SERVICE_CLIENTS__INVENTORY__BASE_URL: http://inventory:8080/
+
+# Secret values → Secret (stringData). Override per environment, or manage the Secret externally
+# (ExternalSecrets) and set secret.create=false.
+secret:
+  create: true
+  values: {}
+    # POSTGRES__DSN: postgres://orders:change-me@postgres:5432/orders?sslmode=require
+    # RABBITMQ__URL: amqp://orders:change-me@rabbitmq:5672/
+    # AUTH__SIGNING_KEY: <base64 of the 32+ byte HS256 key user-svc signs with>
+    # AUTH__ADDITIONAL_SIGNING_KEYS: <during a key rotation only: the other key(s), comma separated>
+  # Secrets a single capability needs and a deployment may lack (a downstream's API key, a
+  # provider credential). Referenced as optional: a pod starts without them and the capability
+  # disables itself (httpclient answers NOT_CONFIGURED) instead of the whole service crash-looping.
+  optionalRefs: []
+  #   - inventory-api-key
+
+# Go runtime knobs derived from the container resources (see _helpers.tpl, msvc.gomemlimit).
+runtime:
+  # GOMEMLIMIT = limits.memory x goMemLimitPercent, rendered into every container that has a memory
+  # limit. The GC only watches GOGC and knows nothing about the cgroup limit: a burst pushes the
+  # heap past the limit and the kubelet OOM-kills the pod before the GC had a reason to run. Set a
+  # GOMEMLIMIT key under config to override, or turn the derivation off. GOMAXPROCS needs nothing:
+  # Go 1.25+ sizes it from the cgroup CPU quota.
+  goMemLimitFromResources: true
+  goMemLimitPercent: 80
+
+# No migration Job: the schema is applied by hand from db/*.sql BEFORE `helm upgrade`.
+
+# The admin listener (SERVER__ADMIN_ADDR) of every pod: probes and /metrics. The Service exposes it
+# for the ServiceMonitor; the Ingress never routes to it.
+adminPort: 8081
+
+api:
+  enabled: true
+  replicas: 2
+  # The API listener: the only port the Ingress routes to.
+  port: 8080
+  # The API pods leave background work to the worker pods when worker.enabled is true: both
+  # values below are set for you by the chart from worker.enabled; override only to change it.
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+worker:
+  # Off by default: the default shape is a single deployment that serves and works the queue.
+  # Turn it on for a service whose background work deserves its own scaling; the API pods then
+  # stop consuming and polling automatically (TASKS__MAX_WORKERS=0, RABBITMQ__CONSUMERS_ENABLED=false).
+  enabled: false
+  replicas: 2
+  # No API listener: a worker serves only the admin port (probes + /metrics).
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  # CPU-based HPA is a poor signal for queue consumers (a starved consumer idles at low CPU while
+  # the queue grows). Prefer KEDA on queue depth when the cluster has KEDA installed.
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  keda:
+    enabled: false # requires KEDA in the cluster; disables the CPU HPA when enabled
+    # Queue naming is "{service name}.{event name}".
+    queueName: msvcservice.orders.order-created.v1
+    queueLength: 20
+    minReplicas: 1
+    maxReplicas: 10
+    # Secret key holding the full AMQP connection string (amqp:// or amqps://).
+    amqpConnectionSecretKey: KEDA__AMQP_CONNECTION
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+# Graceful shutdown: preStop sleep lets endpoints deprogram before SIGTERM; the app then stops
+# within SERVER__SHUTDOWN_TIMEOUT (25s default; the API's in-flight requests get SERVER__DRAIN_TIMEOUT,
+# 15s, of it) and flushes telemetry (up to 5s). The grace period starts counting BEFORE preStop, so:
+#   terminationGracePeriodSeconds >= preStopSleepSeconds + shutdown_timeout + 5s flush + margin
+#                              45 >= 5 + 25 + 5 + 10
+terminationGracePeriodSeconds: 45
+preStopSleepSeconds: 5
+
+# Probes hit the admin port. Readiness runs the dependency checks concurrently, each bounded at 3s
+# in the app: its timeoutSeconds stays above that, or the kubelet gives up on a passing check.
+probes:
+  startup:
+    path: /health/startup
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30
+  liveness:
+    path: /health/live
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /health/ready
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+serviceMonitor:
+  enabled: false # requires the Prometheus Operator CRDs
+  interval: 15s
+
+ingress:
+  enabled: false
+  className: nginx
+  host: msvcservice.example.com
+  path: /
+  annotations: {}
+  tls: []
+
+serviceAccount:
+  # Dedicated ServiceAccount with the API token not mounted — no pod here talks to the
+  # Kubernetes API. Enable automountToken for workload-identity setups.
+  create: true
+  name: ""
+  automountToken: false
+
+networkPolicy:
+  # Default-deny for this release's pods when enabled: only the rules below (plus DNS egress) are
+  # allowed. Configure ingress (the ingress controller to the http port, Prometheus to the admin
+  # port) and egress (PostgreSQL, Redis, RabbitMQ, downstreams, the collector) BEFORE enabling in
+  # production.
+  enabled: false
+  ingress: []
+  egress: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

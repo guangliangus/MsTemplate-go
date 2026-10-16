@@ -1,0 +1,20 @@
+# Production overlay — apply AFTER the base file; the base is already a safe baseline.
+config:
+  # 10% head sampling — 100% tracing is a cost hole at production traffic.
+  TELEMETRY__TRACE_SAMPLE_RATIO: "0.1"
+
+api:
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+
+worker:
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+
+# Recommended once the rules are filled in for your cluster (default-deny):
+# networkPolicy:
+#   enabled: true
+#   ingress: [ ... ]
+#   egress: [ ... ]

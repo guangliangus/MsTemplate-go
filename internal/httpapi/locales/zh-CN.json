@@ -1,0 +1,8 @@
+{
+  "ORDER_ITEMS_REQUIRED": "请至少添加一件商品",
+  "ORDER_ITEM_INVALID": "商品信息无效",
+  "ORDER_ITEM_UNAVAILABLE": "商品库存不足",
+  "ORDER_NOT_PENDING": "订单状态已变更",
+  "ORDER_NOT_CANCELLABLE": "该订单无法取消",
+  "ORDER_TOTAL_TOO_LARGE": "订单金额超出上限，请拆分为多个订单"
+}

@@ -1,0 +1,170 @@
+# Local infrastructure for msvcservice, plus the service itself as opt-in profiles.
+#
+#   docker compose up -d                        PostgreSQL + Redis + RabbitMQ + WireMock + Jaeger +
+#                                               Prometheus + Grafana, with db/*.sql applied by the
+#                                               one-shot `schema` service. Then `make run` on the host.
+#   docker compose --profile app up -d --build  ...plus the service built from this repository on
+#                                               :8080 (API) and :8081 (probes + /metrics) — the image
+#                                               the pipeline ships, run as a pod is.
+#   docker compose --profile app --profile worker up -d --build
+#                                               ...plus a second copy of the SAME image in worker
+#                                               mode: one image, two deployment shapes.
+#   docker compose down -v                      tear down INCLUDING the database volume
+#
+# Host ports are overridable when something on this machine already holds one:
+#   POSTGRES_HOST_PORT=15432 REDIS_HOST_PORT=16379 docker compose up -d
+#
+# No identity provider here, on purpose: the service validates user-svc's HS256 tokens locally.
+# Locally use the development header identities (X-Dev-Subject / X-Dev-Realm) or mint a token
+# shaped like user-svc's with tools/mint-dev-token.sh (same throwaway key as development.yaml).
+name: msvcservice-dev
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: msvc
+      POSTGRES_PASSWORD: msvc
+      POSTGRES_DB: msvcservice
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18 images want ONE mount at /var/lib/postgresql; the pre-18 mount point
+      # (/var/lib/postgresql/data) makes the image refuse to start.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msvc -d msvcservice"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_HOST_PORT:-15672}:15672" # management UI (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # The downstream inventory service the reference order flow calls; see deploy/compose/wiremock
+  # for the stubs (OUT-OF-STOCK, FAULT and SLOW SKUs demonstrate the breaker and the timeout).
+  wiremock:
+    image: wiremock/wiremock:3.9.1
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "${WIREMOCK_HOST_PORT:-8089}:8080"
+    volumes:
+      - ./deploy/compose/wiremock:/home/wiremock:ro
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_UI_HOST_PORT:-16686}:16686" # UI
+      - "${OTLP_GRPC_HOST_PORT:-4317}:4317"   # OTLP gRPC
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./deploy/compose/prometheus:/etc/prometheus:ro
+      - ./deploy/grafana/alerts.yml:/etc/prometheus-rules/alerts.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    volumes:
+      - ./deploy/compose/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  # DDL runs as its own one-shot service, never from the application: it applies db/*.sql in
+  # numbered order and exits, and the app profiles wait for it — DDL first, then the code that
+  # depends on it, the same order as a real release. Re-running the idempotent scripts on every
+  # `up` is both safe and the only thing that picks up a new db/0004_*.sql on an existing volume.
+  schema:
+    image: postgres:18-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: msvc
+    volumes:
+      - ./db:/db:ro
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        for f in /db/*.sql; do
+          echo ">>> $${f}"
+          psql -v ON_ERROR_STOP=1 -h postgres -U msvc -d msvcservice -q -f "$${f}"
+        done
+        echo "schema applied"
+    restart: "no"
+
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+    image: msvcservice:local
+    command: ["serve"]
+    ports:
+      - "${API_HOST_PORT:-8080}:8080"
+      - "${ADMIN_HOST_PORT:-8081}:8081" # probes + /metrics (the admin listener)
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      schema: { condition: service_completed_successfully }
+    environment:
+      APP_ENV: development
+      POSTGRES__DSN: postgres://msvc:msvc@postgres:5432/msvcservice?sslmode=disable
+      REDIS__ADDR: redis:6379
+      RABBITMQ__URL: amqp://guest:guest@rabbitmq:5672/
+      SERVICE_CLIENTS__INVENTORY__BASE_URL: http://wiremock:8080/
+      TELEMETRY__OTLP_ENDPOINT: http://jaeger:4317
+      LOGGING__FORMAT: json
+      HTTP__FORWARDED_HEADERS__ENABLED: "true"
+
+  worker:
+    profiles: ["worker"]
+    build:
+      context: .
+    image: msvcservice:local
+    command: ["worker"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      schema: { condition: service_completed_successfully }
+    environment:
+      APP_ENV: development
+      POSTGRES__DSN: postgres://msvc:msvc@postgres:5432/msvcservice?sslmode=disable
+      REDIS__ADDR: redis:6379
+      RABBITMQ__URL: amqp://guest:guest@rabbitmq:5672/
+      SERVICE_CLIENTS__INVENTORY__BASE_URL: http://wiremock:8080/
+      TELEMETRY__OTLP_ENDPOINT: http://jaeger:4317
+      LOGGING__FORMAT: json
+    # No ports published: the worker has no API listener; its probes and /metrics answer in-network
+    # on the admin port (8081).
+
+volumes:
+  pgdata:

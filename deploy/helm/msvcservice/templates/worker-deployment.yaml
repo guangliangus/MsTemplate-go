@@ -1,0 +1,35 @@
+{{- if .Values.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "msvc.fullname" . }}-worker
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if and (not .Values.worker.hpa.enabled) (not .Values.worker.keda.enabled) }}
+  replicas: {{ .Values.worker.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "msvc.worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "msvc.worker.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "msvc.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          {{- include "msvc.container" (dict "root" . "command" "worker" "port" 0 "resources" .Values.worker.resources "extraEnv" (dict)) | nindent 10 }}
+{{- end }}

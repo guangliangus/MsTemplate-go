@@ -1,0 +1,217 @@
+# Defaults for every deployment, embedded in the binary. An environment overlay
+# (development.yaml) is applied on top when APP_ENV names one, then environment variables:
+# SECTION__KEY (upper-case, "__" between levels) overrides any key below, e.g. POSTGRES__DSN,
+# AUTH__SIGNING_KEY, TASKS__MAX_WORKERS=0, RABBITMQ__RETRY_DELAYS=30s,2m,10m.
+# Secrets (connection strings, the signing key) only ever arrive through the environment.
+
+service:
+  name: msvcservice
+
+server:
+  # The API listener: the only port the ingress routes to.
+  addr: ":8080"
+  # Probes and /metrics live on their own listener, never behind the ingress; a worker serves only this.
+  admin_addr: ":8081"
+  read_header_timeout: 5s
+  read_timeout: 60s
+  # Must exceed request_timeout, or the connection is cut before the 504 can be written.
+  write_timeout: 60s
+  idle_timeout: 120s
+  # The whole stop budget after SIGTERM, shared by every component in stop order. The pod's
+  # terminationGracePeriodSeconds starts counting BEFORE preStop, so it must cover preStop (5s) +
+  # this + the telemetry flush (5s) + a margin: the chart sets 45s.
+  shutdown_timeout: 25s
+  # The API listener's share of shutdown_timeout for in-flight requests (must be below it): the
+  # consumers, the task runner and the outbox stop after it and need the rest.
+  drain_timeout: 15s
+  # Per-request deadline handlers see on their context; honoured work answers 504 REQUEST_TIMEOUT.
+  request_timeout: 30s
+  max_body_bytes: 1048576
+
+http:
+  forwarded_headers:
+    # Off here, on in the chart: behind the ingress RemoteAddr is a node address. Empty
+    # trusted_proxies trusts every proxy; set the pod CIDR to tighten.
+    enabled: false
+    trusted_proxies: []
+  cors:
+    origins: []
+    max_age: 600
+  rate_limiting:
+    # In-process and PER POD: the global budget is (value x replicas). True global limiting is
+    # the gateway's job, as is stopping anonymous floods (they 401 before reaching this).
+    enabled: true
+    global: global
+    policies:
+      global: { requests: 100, window: 1s, partition_by: caller }
+      writes: { requests: 20, window: 10s, partition_by: caller }
+  idempotency:
+    enabled: true
+    header: Idempotency-Key
+    methods: [POST, PATCH]
+    in_flight_ttl: 1m
+    retention: 24h
+    max_body_bytes: 262144
+  # Platform headers each plane's routes require (400 MISSING_HEADERS otherwise). The platform's
+  # consumer apps always send X-Platform, X-Device-ID, X-Request-ID and X-Language; list them here
+  # when the service depends on them. X-Request-ID and X-Language reach downstream calls whether
+  # listed or not (see service_clients.*.propagate_headers).
+  required_headers:
+    consumer: []
+    backoffice: []
+  # Prefix of the RFC 9457 type URI; the kebab-case errorCode is appended (urn:msvc:error:not-found).
+  problem_type_base_uri: "urn:msvc:error:"
+  # Scalar API reference at /docs and the spec at /openapi.yaml; the development overlay turns it on.
+  docs_enabled: false
+
+logging:
+  level: info
+  # json for the cluster's log collector, text for a terminal.
+  format: json
+  # Empty means the built-in list: password, secret, token, authorization, client_secret, ...
+  masked_fields: []
+
+telemetry:
+  # Traces are pushed here over OTLP/gRPC (Jaeger locally, the collector in production); empty
+  # disables the exporter. Metrics are never pushed: Prometheus scrapes /metrics.
+  otlp_endpoint: http://localhost:4317
+  # Head sampling, parent-based. 1.0 locally; the production chart sets 0.1.
+  trace_sample_ratio: 1.0
+  # Longest span attribute value in bytes (a SQL statement is one attribute); 0 = unlimited.
+  attribute_value_length_limit: 2048
+
+postgres:
+  dsn: postgres://msvc:msvc@localhost:5432/msvcservice?sslmode=disable
+  max_conns: 16
+  min_conns: 2
+  max_conn_lifetime: 30m
+  max_conn_idle_time: 5m
+  health_check_period: 30s
+  connect_timeout: 5s
+  # Server-side statement_timeout on every session.
+  statement_timeout: 30s
+  # Server-side idle_in_transaction_session_timeout: a transaction left open while the code waits on
+  # something else is ended by the database instead of holding its locks and the vacuum horizon.
+  # Nothing slow belongs inside a transaction; 0 disables the safety net.
+  idle_in_transaction_timeout: 60s
+  # Statements slower than this are logged, text only, never arguments; 0 disables. Elapsed does
+  # not include waiting for a pool connection: that shows in pgxpool_empty_acquire_total.
+  slow_query_threshold: 1s
+  # Slow-query log lines per second per pod; past it the statements are only counted. 0 = unlimited.
+  slow_query_log_rate: 10
+
+redis:
+  addr: localhost:6379
+  username: ""
+  password: ""
+  db: 0
+  # Required; namespaces every key on a shared Redis. Must end with ':'.
+  key_prefix: "msvcservice:"
+  dial_timeout: 2s
+  # Short on purpose: an unreachable Redis must fail fast so callers apply their fail-open /
+  # fail-closed policy instead of turning into a latency outage.
+  read_timeout: 500ms
+  write_timeout: 500ms
+  max_retries: 1
+  pool_size: 16
+  tls: false
+
+cache:
+  default_ttl: 5m
+  # L1 lifetime; no replica broadcasts invalidation, so this bounds cross-pod staleness.
+  local_ttl: 30s
+  local_max_entries: 10000
+
+rabbitmq:
+  enabled: true
+  url: amqp://guest:guest@localhost:5672/
+  exchange: msvc.events
+  # quorum (replicated) by default; a queue's type cannot be changed in place.
+  queue_type: quorum
+  prefetch: 10
+  consumer_concurrency: 4
+  # Whether this host runs the consumers. An API deployment with a separate worker deployment
+  # sets it false so each message is handled once; the queue names are the same in both modes.
+  consumers_enabled: true
+  # Delayed-retry ladder (TTL queues + dead-lettering, no plugin); after the last step: the DLQ.
+  retry_delays: [30s, 2m, 10m]
+  publisher_confirms: true
+  # One publish as a whole: waiting for a live connection, the channel and the confirm. While the
+  # broker is away the outbox dispatcher does not claim rows at all, so this only bounds the edges.
+  publish_timeout: 5s
+  # On shutdown the consumers stop taking deliveries at once and give in-flight handlers this long
+  # to finish before cancelling them (their messages are requeued).
+  drain_timeout: 5s
+  reconnect_delay: 5s
+  heartbeat: 10s
+
+outbox:
+  poll_interval: 2s
+  batch_size: 50
+  max_attempts: 5
+  # false keeps PUBLISHED outbox rows and processed inbox rows forever (an event journal).
+  cleanup_enabled: true
+  retention: 168h
+  cleanup_interval: 1h
+
+tasks:
+  # 0 is the kill switch: no polling, no fixer, no seeding on this host. The same image serves an
+  # API pod (0) and a worker pod (>0).
+  max_workers: 4
+  # Attempt budget of one-off tasks (0 = unlimited); recurring tasks are exempt. A handler error or
+  # panic spends an attempt and re-arms the task after an exponential backoff:
+  # retry_base_delay, doubling per attempt, capped at retry_max_delay.
+  max_attempts: 5
+  retry_base_delay: 10s
+  retry_max_delay: 10m
+  short_poll_interval: 1s
+  long_poll_interval: 5s
+  # stale_after must be strictly greater than task_timeout (validated): with the two equal the
+  # fixer releases a row whose handler is still working and the same task runs twice.
+  task_timeout: 5m
+  stale_after: 10m
+  drain_timeout: 5s
+  fixer_interval: 1m
+  misfire_threshold: 1m
+  # Overrides by task name: tasks.recurring.<name>: <interval>
+  recurring:
+    pending-orders-reaper: 1m
+  # tasks.cron.<name>: { expression, time_zone, misfire: fire_once_now|skip|catch_up }
+  cron: {}
+  # tasks.queues.<queue>: { max_workers, max_attempts, short_poll_interval, long_poll_interval }
+  queues: {}
+
+auth:
+  # Tokens come from the platform's user service (user-svc), HS256-signed; this service validates
+  # them LOCALLY with the shared key, so an authenticated request costs no network call.
+  # AUTH__SIGNING_KEY arrives from a Secret (base64 of at least 32 bytes) and the service refuses
+  # to boot without it. Audience is deliberately empty: user-svc tokens carry no aud.
+  issuer: user-svc
+  signing_key: ""
+  # Key rotation: further keys a token may be signed with (AUTH__ADDITIONAL_SIGNING_KEYS=k1,k2, from
+  # the Secret). Add the new key here, let user-svc switch, then promote it to signing_key and drop
+  # the old one after the longest token lifetime. Empty outside a rotation.
+  additional_signing_keys: []
+  audience: ""
+  clock_skew: 30s
+  dev_headers:
+    enabled: false
+
+# Named downstream clients, called by Kubernetes service name. base_url must end with '/'.
+service_clients:
+  inventory:
+    base_url: http://localhost:8089/
+    # Budget for the whole call, retries included.
+    timeout: 5s
+    retry: { max_attempts: 3, base_delay: 200ms, max_delay: 2s }
+    breaker: { enabled: true, failure_threshold: 5, open_duration: 30s, half_open_max_requests: 1, interval: 60s }
+    # none, or forward_caller to pass the caller's bearer token on.
+    credentials: none
+    # Inbound headers copied onto every call; empty means X-Request-ID and X-Language. X-Service-Name
+    # is always sent, and X-Request-ID is generated when the inbound request brought none.
+    propagate_headers: []
+
+# Service-specific settings for the reference Orders module.
+orders:
+  # The reaper cancels PENDING orders older than this.
+  pending_timeout: 30m

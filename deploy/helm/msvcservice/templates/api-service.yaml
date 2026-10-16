@@ -1,0 +1,21 @@
+{{- if .Values.api.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "msvc.fullname" . }}-api
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "msvc.api.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.api.port }}
+      targetPort: http
+    # Probes and /metrics: for the ServiceMonitor. The Ingress only ever names the http port.
+    - name: admin
+      port: {{ .Values.adminPort }}
+      targetPort: admin
+{{- end }}

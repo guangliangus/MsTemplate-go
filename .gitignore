@@ -1,0 +1,23 @@
+# Binaries and build output
+bin/
+dist/
+*.exe
+*.test
+*.out
+coverage*.txt
+coverage*.html
+
+# Go workspace and vendored modules (modules are fetched; go.sum is committed)
+go.work
+go.work.sum
+vendor/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local secrets and overrides
+.env
+.env.*
+*.local.yaml
