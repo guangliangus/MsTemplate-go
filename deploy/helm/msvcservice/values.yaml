@@ -12,12 +12,17 @@ image:
 imagePullSecrets: []
 
 # Non-secret configuration → ConfigMap, injected via envFrom. Keys are SECTION__KEY.
+# PLACEHOLDERS: the keys marked "CHANGE ME" name the template's example cluster. A service
+# generated from the template must point them at its own environment (ingress.host below too)
+# before its first deploy — the chart cannot know your Redis, your collector or your downstreams.
 config:
   APP_ENV: production
   LOGGING__FORMAT: json
   # Head-sample traces in production ("0.1" = 10%); 1.0 records everything.
   TELEMETRY__TRACE_SAMPLE_RATIO: "1.0"
+  # CHANGE ME: the OTLP gRPC endpoint of your collector (empty disables trace export).
   TELEMETRY__OTLP_ENDPOINT: http://otel-collector.observability:4317
+  # CHANGE ME: the Redis this service uses (host:port; the password, if any, goes in the Secret).
   REDIS__ADDR: redis:6379
   # The platform's user service issues every token (HS256); this service validates them locally
   # against the same key. The key is a secret and lives under `secret.values` as AUTH__SIGNING_KEY.
@@ -26,17 +31,39 @@ config:
   # Pods sit behind the ingress: honour X-Forwarded-For. With no trusted proxies configured every
   # source is trusted; set the pod CIDR to restrict: HTTP__FORWARDED_HEADERS__TRUSTED_PROXIES: "10.0.0.0/8"
   HTTP__FORWARDED_HEADERS__ENABLED: "true"
+  # CHANGE ME: the reference order flow's downstream. Replace with your own service_clients.*
+  # base URLs (Kubernetes service names, trailing slash) or drop it with the orders example.
   SERVICE_CLIENTS__INVENTORY__BASE_URL: http://inventory:8080/
+  # Kafka, for the events listed in KAFKA__EVENTS (the rest stay on RabbitMQ). Off unless set;
+  # CHANGE ME when a service turns it on (the SASL password goes in the Secret):
+  # KAFKA__ENABLED: "true"
+  # KAFKA__BROKERS: kafka-0.kafka:9092,kafka-1.kafka:9092
+  # KAFKA__EVENTS: orders.order-created.v1
+  # KAFKA__TLS: "true"
+  # KAFKA__SASL__MECHANISM: SCRAM-SHA-512
+  # KAFKA__SASL__USERNAME: msvcservice
 
-# Secret values → Secret (stringData). Override per environment, or manage the Secret externally
-# (ExternalSecrets) and set secret.create=false.
+# Secret values → the Secret every container reads through envFrom (POSTGRES__DSN, RABBITMQ__URL,
+# AUTH__SIGNING_KEY, ...). The pods refuse to start without them, so the chart never ships an
+# empty Secret: with create=true and no values, `helm template`/`helm upgrade` fail at render time
+# instead of rolling out a pod that cannot boot. Three ways to provide them:
+#   create=false (the default, and what the pipeline's overlays use): the operator creates a Secret
+#       named <release>-secrets in the namespace BEFORE the first `helm upgrade --install`
+#       (README, "从零新增一个服务" step 8) — by hand, ExternalSecrets, Vault, whatever the cluster uses.
+#   existingName: the operator's Secret has another name; the chart mounts that one and creates none.
+#   create=true + values: the chart renders the Secret (kind smoke test, a throwaway namespace).
 secret:
-  create: true
+  create: false
+  # Name of a Secret that already holds the keys below. Set, it is mounted as-is, `create` and
+  # `values` are ignored, and the pods carry no checksum/secret annotation (the chart does not
+  # see its content: after rotating it, `kubectl rollout restart`).
+  existingName: ""
   values: {}
     # POSTGRES__DSN: postgres://orders:change-me@postgres:5432/orders?sslmode=require
     # RABBITMQ__URL: amqp://orders:change-me@rabbitmq:5672/
     # AUTH__SIGNING_KEY: <base64 of the 32+ byte HS256 key user-svc signs with>
     # AUTH__ADDITIONAL_SIGNING_KEYS: <during a key rotation only: the other key(s), comma separated>
+    # KAFKA__SASL__PASSWORD: <the Kafka user's password, when KAFKA__SASL__MECHANISM is set>
   # Secrets a single capability needs and a deployment may lack (a downstream's API key, a
   # provider credential). Referenced as optional: a pod starts without them and the capability
   # disables itself (httpclient answers NOT_CONFIGURED) instead of the whole service crash-looping.
@@ -66,8 +93,14 @@ api:
   port: 8080
   # The API pods leave background work to the worker pods when worker.enabled is true: both
   # values below are set for you by the chart from worker.enabled; override only to change it.
+  #
+  # The HPA target is a percentage of requests.cpu, not of the limit: with a 100m request and a
+  # 70% target the deployment scales out at 70m average — idle-ish pods would fan out to
+  # maxReplicas on the first bit of traffic. 250m makes the trigger 175m, a real load signal;
+  # size the request at the steady-state CPU of ONE pod and keep the limit for bursts.
+  # limits.memory also sets GOMEMLIMIT (runtime.goMemLimitFromResources).
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
+    requests: { cpu: 250m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
   hpa:
     enabled: true
@@ -81,12 +114,14 @@ api:
 worker:
   # Off by default: the default shape is a single deployment that serves and works the queue.
   # Turn it on for a service whose background work deserves its own scaling; the API pods then
-  # stop consuming and polling automatically (TASKS__MAX_WORKERS=0, RABBITMQ__CONSUMERS_ENABLED=false).
+  # stop consuming and polling automatically (TASKS__MAX_WORKERS=0, RABBITMQ__CONSUMERS_ENABLED=false,
+  # KAFKA__CONSUMERS_ENABLED=false).
   enabled: false
   replicas: 2
   # No API listener: a worker serves only the admin port (probes + /metrics).
+  # Same HPA arithmetic as the api: the 70% target is of requests.cpu (250m → scale-out at 175m).
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
+    requests: { cpu: 250m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
   # CPU-based HPA is a poor signal for queue consumers (a starved consumer idles at low CPU while
   # the queue grows). Prefer KEDA on queue depth when the cluster has KEDA installed.
@@ -97,23 +132,50 @@ worker:
     targetCPUUtilizationPercentage: 70
   keda:
     enabled: false # requires KEDA in the cluster; disables the CPU HPA when enabled
+    # What the worker scales on: rabbitmq = the depth of queueName; kafka = the lag of
+    # kafka.consumerGroup on kafka.topic, for a worker whose events live on Kafka (kafka.events).
+    trigger: rabbitmq
     # Queue naming is "{service name}.{event name}".
     queueName: msvcservice.orders.order-created.v1
     queueLength: 20
     minReplicas: 1
     maxReplicas: 10
-    # Secret key holding the full AMQP connection string (amqp:// or amqps://).
-    amqpConnectionSecretKey: KEDA__AMQP_CONNECTION
+    # The AMQP connection string KEDA polls the queue with (amqp:// or amqps://, a management-API
+    # capable user). It is KEDA's credential, not the app's, so it lives in its own Secret
+    # (<release>-keda) and is never envFrom'd into the containers. Either set it here (the chart
+    # renders <release>-keda) or point existingSecretName at a Secret that already holds it under
+    # amqpConnectionSecretKey. With keda.enabled and neither set, the render fails.
+    amqpConnection: ""
+    existingSecretName: ""
+    amqpConnectionSecretKey: amqpConnection
+    # trigger=kafka. KEDA reads the group's lag from the brokers; it never adds more replicas
+    # than the topic has partitions (a Kafka group cannot use more consumers than partitions).
+    kafka:
+      # CHANGE ME: host:port,host:port of the cluster the service's KAFKA__BROKERS names.
+      bootstrapServers: ""
+      # Consumer group naming is "{service name}.{event name}", the same as a RabbitMQ queue.
+      consumerGroup: msvcservice.orders.order-created.v1
+      # The event's topic: the event name, unless the service maps it in kafka.topics.
+      topic: orders.order-created.v1
+      lagThreshold: 20
+      # KEDA's own Kafka login (its credential, not the app's): none, plaintext, scram_sha256 or
+      # scram_sha512. Anything but none is rendered into <release>-keda (or read from
+      # existingSecretName under the keys sasl, username, password, tls).
+      sasl: none
+      tls: disable
+      username: ""
+      password: ""
   pdb:
     enabled: true
     minAvailable: 1
 
 # Graceful shutdown: preStop sleep lets endpoints deprogram before SIGTERM; the app then stops
-# within SERVER__SHUTDOWN_TIMEOUT (25s default; the API's in-flight requests get SERVER__DRAIN_TIMEOUT,
-# 15s, of it) and flushes telemetry (up to 5s). The grace period starts counting BEFORE preStop, so:
+# within SERVER__SHUTDOWN_TIMEOUT (30s default; the API's in-flight requests get SERVER__DRAIN_TIMEOUT,
+# 12s, of it, the Kafka and RabbitMQ consumers and the task runner 5s each) and flushes telemetry
+# (up to 5s). The grace period starts counting BEFORE preStop, so:
 #   terminationGracePeriodSeconds >= preStopSleepSeconds + shutdown_timeout + 5s flush + margin
-#                              45 >= 5 + 25 + 5 + 10
-terminationGracePeriodSeconds: 45
+#                              50 >= 5 + 30 + 5 + 10
+terminationGracePeriodSeconds: 50
 preStopSleepSeconds: 5
 
 # Probes hit the admin port. Readiness runs the dependency checks concurrently, each bounded at 3s
@@ -142,6 +204,7 @@ serviceMonitor:
 ingress:
   enabled: false
   className: nginx
+  # CHANGE ME: the public host name of this service.
   host: msvcservice.example.com
   path: /
   annotations: {}

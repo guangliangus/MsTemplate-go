@@ -1,7 +1,9 @@
 //go:build integration
 
-// Package integration runs the kit and the reference module against real PostgreSQL, Redis and
-// RabbitMQ containers, on the schema from db/*.sql. Run with `make test-integration`.
+// Package integration runs the service's own code against a real PostgreSQL container, on the
+// schema from db/*.sql. The kit's behaviour (outbox, inbox, task queue, broker, Redis) is tested in
+// go-msvc-kit; what is left here is what only this service has: its repository, and its rows
+// committing in one transaction with the kit's outbox row. Run with `make test-integration`.
 package integration
 
 import (
@@ -12,18 +14,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
 	"example.com/msvcservice/internal/order"
 	svcpg "example.com/msvcservice/internal/postgres"
-	"example.com/msvcservice/pkg/actor"
-	"example.com/msvcservice/pkg/apperror"
-	"example.com/msvcservice/pkg/messaging"
-	"example.com/msvcservice/pkg/paging"
-	"example.com/msvcservice/pkg/postgres"
-	"example.com/msvcservice/pkg/taskqueue"
-	"example.com/msvcservice/pkg/testutil"
+	"github.com/guangliangus/go-msvc-kit/actor"
+	"github.com/guangliangus/go-msvc-kit/apperror"
+	"github.com/guangliangus/go-msvc-kit/messaging"
+	"github.com/guangliangus/go-msvc-kit/paging"
+	"github.com/guangliangus/go-msvc-kit/postgres"
+	"github.com/guangliangus/go-msvc-kit/testutil"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -147,39 +147,6 @@ func TestOrderRepositoryListsAllByKeyset(t *testing.T) {
 	}
 }
 
-// AfterCommit work runs once the outermost transaction commits, never on a rollback, and at once
-// outside a transaction.
-func TestAfterCommitRunsOnlyAfterTheCommit(t *testing.T) {
-	db := openDB(t)
-	ctx := context.Background()
-	var ran []string
-	err := db.WithTx(ctx, func(ctx context.Context) error {
-		db.AfterCommit(ctx, func(context.Context) { ran = append(ran, "outer") })
-		return db.WithTx(ctx, func(ctx context.Context) error { // joins the outer transaction
-			db.AfterCommit(ctx, func(context.Context) { ran = append(ran, "inner") })
-			if len(ran) != 0 {
-				t.Error("nothing runs before the commit")
-			}
-			return nil
-		})
-	})
-	if err != nil || len(ran) != 2 || ran[0] != "outer" || ran[1] != "inner" {
-		t.Fatalf("after the commit, in registration order: %v %v", ran, err)
-	}
-	ran = nil
-	_ = db.WithTx(ctx, func(ctx context.Context) error {
-		db.AfterCommit(ctx, func(context.Context) { ran = append(ran, "rolled back") })
-		return errors.New("refused")
-	})
-	if len(ran) != 0 {
-		t.Fatalf("a rollback runs nothing: %v", ran)
-	}
-	db.AfterCommit(ctx, func(context.Context) { ran = append(ran, "now") })
-	if len(ran) != 1 {
-		t.Fatal("outside a transaction it runs at once")
-	}
-}
-
 func TestTransactionsCarryOnTheContext(t *testing.T) {
 	db := openDB(t)
 	repo := svcpg.NewOrderRepository(db)
@@ -230,128 +197,3 @@ type testEvent struct {
 }
 
 func (testEvent) EventName() string { return "test.event.v1" }
-
-func TestInboxProcessesOnce(t *testing.T) {
-	db := openDB(t)
-	inbox := messaging.NewInbox(db)
-	ctx := context.Background()
-	id := uuid.New()
-	runs := 0
-	for i := range 2 {
-		processed, err := inbox.ProcessOnce(ctx, id, "consumer-a", func(context.Context) error { runs++; return nil })
-		if err != nil {
-			t.Fatal(err)
-		}
-		if first := i == 0; processed != first {
-			t.Fatalf("delivery %d: processed=%v runs=%d", i+1, processed, runs)
-		}
-	}
-	if runs != 1 {
-		t.Fatalf("handler ran %d times", runs)
-	}
-	// A different consumer of the same message is a different ledger entry.
-	if processed, _ := inbox.ProcessOnce(ctx, id, "consumer-b", func(context.Context) error { return nil }); !processed {
-		t.Fatal("per-consumer deduplication")
-	}
-	// A failing handler rolls the ledger row back, so a redelivery runs again.
-	boom := apperror.Internal(nil)
-	other := uuid.New()
-	if _, err := inbox.ProcessOnce(ctx, other, "consumer-a", func(context.Context) error { return boom }); err == nil {
-		t.Fatal("handler error must surface")
-	}
-	if processed, _ := inbox.ProcessOnce(ctx, other, "consumer-a", func(context.Context) error { return nil }); !processed {
-		t.Fatal("after a failure the message is processable again")
-	}
-}
-
-func TestTaskQueueStore(t *testing.T) {
-	db := openDB(t)
-	store := taskqueue.NewStore(db)
-	ctx := actor.WithName(context.Background(), "tester")
-
-	inserted, err := store.Enqueue(ctx, taskqueue.EnqueueRequest{QueueName: "q", TaskID: "t1", Payload: map[string]int{"n": 1}, Priority: 1})
-	if err != nil || !inserted {
-		t.Fatalf("enqueue: %v %v", inserted, err)
-	}
-	if again, _ := store.Enqueue(ctx, taskqueue.EnqueueRequest{QueueName: "q", TaskID: "t1"}); again {
-		t.Fatal("enqueue is idempotent on (queue, task id)")
-	}
-	n, err := store.EnqueueBatch(ctx, []taskqueue.EnqueueRequest{
-		{QueueName: "q", TaskID: "t1"},
-		{QueueName: "q", TaskID: "t2", DeliverOn: time.Now().Add(time.Hour)},
-		{QueueName: "q", TaskID: "t3"},
-	})
-	if err != nil || n != 2 {
-		t.Fatalf("batch inserted %d: %v", n, err)
-	}
-
-	popped, err := store.Pop(ctx, "q", 10, "runner-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(popped) != 2 || popped[0].TaskID != "t1" || popped[0].Attempt != 1 || string(popped[0].Payload) != `{"n": 1}` {
-		t.Fatalf("pop order/attempts/payload: %+v", popped)
-	}
-	if again, _ := store.Pop(ctx, "q", 10, "runner-2"); len(again) != 0 {
-		t.Fatal("claimed rows are invisible to other runners")
-	}
-
-	if err := store.ReArm(ctx, "q", "t1", 0, false); err != nil {
-		t.Fatal(err)
-	}
-	retried, _ := store.Pop(ctx, "q", 10, "runner-1")
-	if len(retried) != 1 || retried[0].Attempt != 2 {
-		t.Fatalf("a retry keeps counting attempts: %+v", retried)
-	}
-
-	depths, err := store.CountPending(ctx)
-	if err != nil || depths["q"] != 0 {
-		t.Fatalf("depth counts only claimable rows: %v %v", depths, err)
-	}
-	if reclaimed, _ := store.ReclaimStale(ctx, time.Nanosecond); reclaimed != 2 {
-		t.Fatalf("stale claims re-armed: %d", reclaimed)
-	}
-	if done, _ := store.Complete(ctx, "q", "t3"); !done {
-		t.Fatal("complete deletes the row")
-	}
-	if gone, _ := store.Complete(ctx, "q", "t3"); gone {
-		t.Fatal("completing twice is a no-op")
-	}
-}
-
-func TestTaskQueueRunnerExecutesRecurringTask(t *testing.T) {
-	db := openDB(t)
-	store := taskqueue.NewStore(db)
-	cfg := taskqueue.Config{MaxWorkers: 2, ShortPollInterval: 50 * time.Millisecond, LongPollInterval: 100 * time.Millisecond,
-		TaskTimeout: 5 * time.Second, StaleAfter: 10 * time.Second, DrainTimeout: 2 * time.Second, FixerInterval: time.Second}
-	runner := taskqueue.NewRunner(store, cfg, quiet)
-	fired := make(chan taskqueue.Task, 4)
-	if err := runner.Recurring("tick", 200*time.Millisecond, taskqueue.HandlerFunc(func(_ context.Context, task taskqueue.Task) (taskqueue.Result, error) {
-		fired <- task
-		return taskqueue.Done(), nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
-
-	var first, second taskqueue.Task
-	select {
-	case first = <-fired:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the recurring task never fired")
-	}
-	select {
-	case second = <-fired:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the recurring task did not re-arm")
-	}
-	if first.Attempt != 1 || second.Attempt != 1 {
-		t.Fatalf("a recurring run starts a fresh attempt cycle: %d %d", first.Attempt, second.Attempt)
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-}

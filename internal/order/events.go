@@ -1,6 +1,10 @@
 package order
 
-import "example.com/msvcservice/pkg/money"
+import (
+	"strconv"
+
+	"github.com/guangliangus/go-msvc-kit/money"
+)
 
 // EventCreated is the routing key of CreatedEvent: explicit and versioned, never derived from the
 // Go type, so a rename cannot silently change it.
@@ -16,3 +20,7 @@ type CreatedEvent struct {
 
 // EventName implements messaging.Event.
 func (CreatedEvent) EventName() string { return EventCreated }
+
+// PartitionKey implements messaging.Keyed: the order id. On Kafka every event of one order lands
+// on one partition and is consumed in publish order; RabbitMQ ignores it.
+func (e CreatedEvent) PartitionKey() string { return strconv.Itoa(e.OrderID) }

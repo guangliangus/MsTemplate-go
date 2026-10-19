@@ -1,7 +1,10 @@
 # CI/CD for msvcservice.
-# Prereqs: a Docker registry service connection (containerRegistry) and Kubernetes service
-# connections (k8sConnectionDev / k8sConnectionProd) configured in the Azure DevOps project, plus a
-# CiDatabaseUrl pipeline variable (a libpq URI to a throwaway PostgreSQL) for the DDL gate.
+# Prereqs: a Docker registry service connection (containerRegistry — and registryHost below set to
+# THAT registry's host name) and Kubernetes service connections (k8sConnectionDev /
+# k8sConnectionProd) configured in the Azure DevOps project, and a GitHubKitToken SECRET variable:
+# a read-only fine-grained GitHub token (repository go-msvc-kit only, Contents: Read) with which
+# the go command and the image build fetch the private kit. The DDL gate starts its own PostgreSQL
+# on the agent for the run and needs nothing.
 
 trigger:
   branches:
@@ -11,7 +14,12 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
+  # The Go toolchain is pinned here and in the Dockerfile (golang:<minor>-alpine); Renovate bumps
+  # both in one PR (renovate.json, "Go toolchain").
+  # renovate: datasource=golang-version depName=go versioning=go-mod-directive
   goVersion: "1.27"
+  # The platform kit is a private GitHub module: no public proxy, no public checksum database.
+  GOPRIVATE: github.com/guangliangus/*
   # Tool versions are pinned (Renovate bumps them, see renovate.json); install scripts are fetched
   # from the SAME tag they install, never from a moving branch. The Go tools (gotestsum,
   # gocover-cobertura, govulncheck) are pinned in tools/go.mod instead.
@@ -22,11 +30,19 @@ variables:
   # Helm 3: Helm 4 deprecates the deploy step's --atomic (now --rollback-on-failure); move both together.
   # renovate: datasource=github-releases depName=helm/helm
   helmVersion: v3.22.0
+  # The PostgreSQL the DDL gate runs against (same major as docker-compose.yml / deploy/kind).
+  # renovate: datasource=docker depName=postgres
+  postgresVersion: 18-alpine
   securityScan: true
   containerRegistry: my-registry-connection
+  # AUTHORITATIVE image location: every image reference in this pipeline (build tag, scan, push,
+  # Helm image.repository) is $(registryHost)/$(imageName):$(imageTag). The service connection
+  # above only provides the login, so registryHost MUST be that connection's host — otherwise the
+  # push lands in one registry and the deploy pulls from another.
   registryHost: registry.example.com
   imageName: msvcservice
   imageTag: $(Build.BuildNumber)
+  imageRef: $(registryHost)/$(imageName):$(imageTag)
   helmReleaseName: msvcservice
   buildWorker: false # flip to true for a service with its own worker deployment
   k8sConnectionDev: my-k8s-connection-dev
@@ -47,6 +63,14 @@ stages:
             displayName: Pin Go
             inputs:
               version: $(goVersion)
+
+          - script: |
+              set -e
+              printf 'machine github.com login x-access-token password %s\n' "$KIT_TOKEN" > "$HOME/.netrc"
+              chmod 600 "$HOME/.netrc"
+            displayName: Credential for the private kit module
+            env:
+              KIT_TOKEN: $(GitHubKitToken)
 
           - script: go mod download
             displayName: go mod download
@@ -75,7 +99,7 @@ stages:
           - script: |
               set -e
               go tool -modfile=tools/go.mod gotestsum --junitfile "$(Build.ArtifactStagingDirectory)/integration.xml" --format testname -- \
-                -race -count=1 -tags=integration -timeout 20m ./tests/... ./pkg/...
+                -race -count=1 -tags=integration -timeout 20m ./tests/...
             displayName: integration tests (Testcontainers)
             env:
               CI: "true"
@@ -99,17 +123,65 @@ stages:
           - script: go tool -modfile=tools/go.mod govulncheck ./...
             displayName: govulncheck
 
-          # DDL gate: every db/*.sql is applied twice; the second pass must succeed with no side
-          # effects, which is what "idempotent, re-runnable by hand" means in practice.
+          # DDL gate: every db/*.sql is applied twice to a PostgreSQL started on the agent for this
+          # run; the second pass must succeed with no side effects, which is what "idempotent,
+          # re-runnable by hand" means in practice. A fresh database every run: nothing left by an
+          # earlier run can turn the first pass into a no-op and hide a non-idempotent script.
           - script: |
               set -e
-              for f in db/*.sql; do
-                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
-                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+              docker run -d --rm --name ddl-gate -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=ci "postgres:$(postgresVersion)"
+              trap 'docker rm -f ddl-gate >/dev/null 2>&1 || true' EXIT
+              # -h localhost (TCP): only the final server listens there, not the init-time one.
+              for _ in $(seq 1 30); do
+                docker exec ddl-gate pg_isready -h localhost -U postgres -d ci >/dev/null 2>&1 && break
+                sleep 1
               done
-            displayName: DDL idempotency (run twice)
+              docker exec ddl-gate pg_isready -h localhost -U postgres -d ci
+              for f in db/*.sql; do
+                echo ">>> $f"
+                docker exec -i -e PGPASSWORD=ci ddl-gate psql -h localhost -U postgres -d ci -v ON_ERROR_STOP=1 -q < "$f"
+                docker exec -i -e PGPASSWORD=ci ddl-gate psql -h localhost -U postgres -d ci -v ON_ERROR_STOP=1 -q < "$f"
+              done
+            displayName: DDL idempotency (run twice against a fresh PostgreSQL)
+
+          - task: HelmInstaller@1
+            displayName: Pin Helm
+            inputs:
+              helmVersionToInstall: $(helmVersion)
+
+          # Chart breakage fails here, before merge, not in the deploy stage: lint, then render every
+          # shape the pipeline deploys (both overlays, worker off and on) with the image reference the
+          # Package stage would ship. The overlays create no Secret (the operator does), so this needs
+          # no secret values.
+          - script: |
+              set -e
+              helm lint deploy/helm/msvcservice
+              for env in dev prod; do
+                for worker in false true; do
+                  helm template $(helmReleaseName) deploy/helm/msvcservice \
+                    -f deploy/helm/msvcservice/values.$env.yaml \
+                    --set image.repository=$(registryHost)/$(imageName) --set image.tag=$(imageTag) \
+                    --set worker.enabled=$worker > /dev/null
+                done
+              done
+            displayName: helm lint & template (both overlays, worker off/on)
+
+          # The image is built on every run and pushed on none: a broken Dockerfile or a kit
+          # credential problem fails before merge. Same BuildKit secret as the Package stage.
+          - script: |
+              set -e
+              docker build --secret id=netrc,env=KIT_NETRC --build-arg VERSION=$(imageTag) \
+                -t "$(imageName):ci-$(imageTag)" .
+            displayName: docker build (no push)
             env:
-              DATABASE_URL: $(CiDatabaseUrl)
+              DOCKER_BUILDKIT: "1"
+              KIT_NETRC: machine github.com login x-access-token password $(GitHubKitToken)
+
+          # The kit credential was written to the agent's home for the go command. A hosted agent
+          # is discarded after the job; a self-hosted one is not, so remove it whatever happened.
+          - script: rm -f "$HOME/.netrc"
+            displayName: Remove the kit credential
+            condition: always()
 
   - stage: Package
     displayName: Docker build, scan & push
@@ -124,30 +196,30 @@ stages:
               command: login
               containerRegistry: $(containerRegistry)
 
-          - task: Docker@2
-            displayName: Build & push image
-            inputs:
-              command: buildAndPush
-              containerRegistry: $(containerRegistry)
-              repository: $(imageName)
-              dockerfile: Dockerfile
-              buildContext: .
-              arguments: --build-arg VERSION=$(imageTag)
-              tags: |
-                $(imageTag)
+          # Build, scan and push are separate steps on purpose: the Docker@2 buildAndPush command
+          # ignores `arguments`, which would silently drop both the version build arg and the kit
+          # secret, and the scan sits between build and push. One reference, $(imageRef), names
+          # the image in all three. The kit credential reaches the build as a BuildKit secret,
+          # never as a build arg.
+          - script: |
+              set -e
+              docker build --secret id=netrc,env=KIT_NETRC --build-arg VERSION=$(imageTag) -t "$(imageRef)" .
+            displayName: Build image
+            env:
+              DOCKER_BUILDKIT: "1"
+              KIT_NETRC: machine github.com login x-access-token password $(GitHubKitToken)
 
-          # Failing the scan blocks the Deploy stage. The tag already exists in the registry at
-          # that point — it just never ships; rebuild with patched bases to clear it.
+          # The scan runs on the local tag BEFORE the push: a HIGH/CRITICAL finding means the tag
+          # never reaches the registry; rebuild with patched bases and the next run ships.
           - script: |
               set -e
               curl -sSfL "https://raw.githubusercontent.com/aquasecurity/trivy/$(trivyVersion)/contrib/install.sh" \
                 | sh -s -- -b "$(Agent.TempDirectory)/trivy-bin" "$(trivyVersion)"
               export PATH="$(Agent.TempDirectory)/trivy-bin:$PATH"
               mkdir -p "$(Build.ArtifactStagingDirectory)/sbom"
-              image="$(registryHost)/$(imageName):$(imageTag)"
-              trivy image --format cyclonedx --output "$(Build.ArtifactStagingDirectory)/sbom/$(imageName).cdx.json" "$image"
-              trivy image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL "$image"
-            displayName: Trivy image scan + SBOM (HIGH/CRITICAL fail)
+              trivy image --format cyclonedx --output "$(Build.ArtifactStagingDirectory)/sbom/$(imageName).cdx.json" "$(imageRef)"
+              trivy image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL "$(imageRef)"
+            displayName: Trivy image scan + SBOM (HIGH/CRITICAL fail, before the push)
             condition: and(succeeded(), eq(variables.securityScan, 'true'))
 
           - task: PublishBuildArtifacts@1
@@ -157,9 +229,21 @@ stages:
               PathtoPublish: $(Build.ArtifactStagingDirectory)/sbom
               ArtifactName: sbom
 
+          - script: docker push "$(imageRef)"
+            displayName: Push image
+
+          - task: Docker@2
+            displayName: Registry logout
+            condition: always()
+            inputs:
+              command: logout
+              containerRegistry: $(containerRegistry)
+
   # Environments are Helm value overlays: values.yaml (safe baseline) + values.{env}.yaml
   # (differences only). Dev deploys automatically; production waits for the approval check on
   # the 'production' environment (Azure DevOps → Environments → production → Approvals).
+  # The chart creates no Secret with these overlays: <release>-secrets (or secret.existingName)
+  # exists in the namespace before the first run (README, "从零新增一个服务" step 7).
   - stage: DeployDev
     displayName: Helm deploy (dev)
     dependsOn: Package
@@ -175,16 +259,6 @@ stages:
                 - task: HelmInstaller@1
                   inputs:
                     helmVersionToInstall: $(helmVersion)
-                - script: |
-                    set -e
-                    helm lint deploy/helm/msvcservice
-                    for env in dev prod; do
-                      helm template $(helmReleaseName) deploy/helm/msvcservice \
-                        -f deploy/helm/msvcservice/values.$env.yaml \
-                        --set image.repository=$(registryHost)/$(imageName) --set image.tag=$(imageTag) \
-                        --set worker.enabled=$(buildWorker) > /dev/null
-                    done
-                  displayName: helm lint & template (both overlays)
                 - task: HelmDeploy@1
                   displayName: helm upgrade (dev)
                   inputs:

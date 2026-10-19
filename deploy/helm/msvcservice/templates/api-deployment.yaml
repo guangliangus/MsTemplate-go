@@ -3,6 +3,7 @@
 {{- if .Values.worker.enabled }}
 {{- $_ := set $extra "TASKS__MAX_WORKERS" "0" }}
 {{- $_ := set $extra "RABBITMQ__CONSUMERS_ENABLED" "false" }}
+{{- $_ := set $extra "KAFKA__CONSUMERS_ENABLED" "false" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -23,7 +24,12 @@ spec:
       labels:
         {{- include "msvc.api.selectorLabels" . | nindent 8 }}
       annotations:
+        # A changed ConfigMap or chart-rendered Secret rolls the pods. With secret.existingName the
+        # Secret is outside the release and nothing is hashed: rotate it, then `kubectl rollout restart`.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if include "msvc.secretManaged" . }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "msvc.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}

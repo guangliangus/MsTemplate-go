@@ -18,7 +18,11 @@ spec:
       labels:
         {{- include "msvc.worker.selectorLabels" . | nindent 8 }}
       annotations:
+        # Same as the api deployment: nothing is hashed for a secret.existingName Secret.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if include "msvc.secretManaged" . }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "msvc.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}

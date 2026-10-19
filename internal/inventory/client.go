@@ -13,17 +13,17 @@ import (
 	"github.com/shopspring/decimal"
 
 	"example.com/msvcservice/internal/order"
-	"example.com/msvcservice/pkg/apperror"
-	"example.com/msvcservice/pkg/httpclient"
+	"github.com/guangliangus/go-msvc-kit/apperror"
+	"github.com/guangliangus/go-msvc-kit/httpclient"
 )
 
 // Client implements order.InventoryClient.
 type Client struct {
-	http *httpclient.Client
+	http httpclient.Doer
 }
 
-// New wraps the named client.
-func New(c *httpclient.Client) *Client {
+// New wraps the named client; httpclient.Doer so a test can hand in a fake.
+func New(c httpclient.Doer) *Client {
 	return &Client{http: c}
 }
 

@@ -1,4 +1,8 @@
 {{- if .Values.serviceMonitor.enabled }}
+# No jobLabel on purpose: the operator then sets the `job` target label to the Service NAME, i.e.
+# <release>-api / <release>-worker — the same values compose's prometheus.yml uses
+# (msvcservice-api / msvcservice-worker) and the only selector deploy/grafana/alerts.yml filters
+# on ({job=~"msvcservice-.*"}). Keep the release named after the service or the rules match nothing.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

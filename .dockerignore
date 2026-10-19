@@ -16,3 +16,8 @@ tools/
 docker-compose.yml
 azure-pipelines.yml
 requests.http
+
+# Local secrets and overrides (gitignored too; never into a build context)
+.env
+.env.*
+*.local.yaml

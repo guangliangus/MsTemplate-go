@@ -8,11 +8,12 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"example.com/msvcservice/internal/order"
-	"example.com/msvcservice/pkg/auth"
-	"example.com/msvcservice/pkg/httpx"
-	"example.com/msvcservice/pkg/middleware"
-	"example.com/msvcservice/pkg/money"
-	"example.com/msvcservice/pkg/paging"
+	"github.com/guangliangus/go-msvc-kit/apperror"
+	"github.com/guangliangus/go-msvc-kit/auth"
+	"github.com/guangliangus/go-msvc-kit/httpx"
+	"github.com/guangliangus/go-msvc-kit/middleware"
+	"github.com/guangliangus/go-msvc-kit/money"
+	"github.com/guangliangus/go-msvc-kit/paging"
 )
 
 // ScopeOrdersRead is the back-office scope that may list every customer's orders.
@@ -20,8 +21,19 @@ const ScopeOrdersRead = "orders.read"
 
 // CreateOrderRequest is the POST body. Wire types live with the handlers that speak them: the
 // JSON and validation tags are this package's concern, and the order package never sees them.
+//
+// Validation is split by what the client got wrong. The struct tags check the SHAPE of the
+// request — the body is JSON, `items` is present, every item carries a `sku` (at most 64 chars)
+// and a `quantity` (1..1000) — and answer 400 VALIDATION_FAILED with every failing field at once,
+// before any business code runs. The order package checks the RULES of an order — how many items
+// it may carry (1..order.MaxItems), what inventory can sell, the total cap — and answers 422 with
+// one of its own codes (order.CheckLines, order.New). The per-item rules exist on both sides on
+// purpose: here so a malformed body is reported field by field, there because an aggregate does
+// not trust its callers (the consumers and the tasks never pass through these tags). The item
+// count is deliberately not a tag: order.MaxItems is the single source of that limit, and the
+// validation tag could not be derived from it.
 type CreateOrderRequest struct {
-	Items []CreateOrderItem `json:"items" validate:"required,min=1,max=100,dive"`
+	Items []CreateOrderItem `json:"items" validate:"required,dive"`
 }
 
 // CreateOrderItem is one requested line: what and how many. There is deliberately no price — the
@@ -117,17 +129,27 @@ func (h *OrdersHandler) BackOfficeRoutes() http.Handler {
 	return r
 }
 
-func customer(r *http.Request) string {
-	p, _ := auth.FromContext(r.Context())
-	return p.Subject
+// customer is the caller's account id. Every route here sits behind the plane group's
+// RequireRealm, so a request without a principal is a wiring mistake; it is answered as a 401,
+// never dereferenced.
+func customer(r *http.Request) (string, error) {
+	p, ok := auth.FromContext(r.Context())
+	if !ok {
+		return "", apperror.Unauthorized("Authentication is required.")
+	}
+	return p.Subject, nil
 }
 
 func (h *OrdersHandler) create(w http.ResponseWriter, r *http.Request) error {
+	customerID, err := customer(r)
+	if err != nil {
+		return err
+	}
 	var req CreateOrderRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		return err
 	}
-	o, err := h.orders.Create(r.Context(), customer(r), req.toLines())
+	o, err := h.orders.Create(r.Context(), customerID, req.toLines())
 	if err != nil {
 		return err
 	}
@@ -135,11 +157,15 @@ func (h *OrdersHandler) create(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *OrdersHandler) get(w http.ResponseWriter, r *http.Request) error {
+	customerID, err := customer(r)
+	if err != nil {
+		return err
+	}
 	id, err := httpx.ParamInt(r, "id")
 	if err != nil {
 		return err
 	}
-	o, err := h.orders.Get(r.Context(), id, customer(r))
+	o, err := h.orders.Get(r.Context(), id, customerID)
 	if err != nil {
 		return err
 	}
@@ -148,11 +174,15 @@ func (h *OrdersHandler) get(w http.ResponseWriter, r *http.Request) error {
 
 // list serves a numbered page of the caller's own orders (?page=&pageSize=).
 func (h *OrdersHandler) list(w http.ResponseWriter, r *http.Request) error {
+	customerID, err := customer(r)
+	if err != nil {
+		return err
+	}
 	page, err := paging.Parse(r.URL.Query())
 	if err != nil {
 		return err
 	}
-	items, total, err := h.orders.List(r.Context(), customer(r), page)
+	items, total, err := h.orders.List(r.Context(), customerID, page)
 	if err != nil {
 		return err
 	}
@@ -175,11 +205,15 @@ func (h *OrdersHandler) listAll(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *OrdersHandler) cancel(w http.ResponseWriter, r *http.Request) error {
+	customerID, err := customer(r)
+	if err != nil {
+		return err
+	}
 	id, err := httpx.ParamInt(r, "id")
 	if err != nil {
 		return err
 	}
-	if err := h.orders.Cancel(r.Context(), id, customer(r)); err != nil {
+	if err := h.orders.Cancel(r.Context(), id, customerID); err != nil {
 		return err
 	}
 	return httpx.NoContent(w)

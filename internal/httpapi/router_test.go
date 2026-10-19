@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -16,88 +15,27 @@ import (
 
 	"example.com/msvcservice/internal/config"
 	"example.com/msvcservice/internal/order"
-	"example.com/msvcservice/pkg/apperror"
-	"example.com/msvcservice/pkg/auth"
-	"example.com/msvcservice/pkg/cache"
-	"example.com/msvcservice/pkg/health"
-	"example.com/msvcservice/pkg/httpx"
-	"example.com/msvcservice/pkg/messaging"
-	"example.com/msvcservice/pkg/middleware"
-	"example.com/msvcservice/pkg/paging"
+	"example.com/msvcservice/internal/order/ordertest"
+	"github.com/guangliangus/go-msvc-kit/auth"
+	"github.com/guangliangus/go-msvc-kit/health"
+	"github.com/guangliangus/go-msvc-kit/httpserver"
+	"github.com/guangliangus/go-msvc-kit/httpx"
+	"github.com/guangliangus/go-msvc-kit/middleware"
+	"github.com/guangliangus/go-msvc-kit/paging"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-type memRepo struct {
-	orders map[int]*order.Order
+// testInventory prices everything at 19.99 and knows OUT-OF-STOCK as unavailable.
+var testInventory = ordertest.Inventory{
+	UnitPrice:   decimal.RequireFromString("19.99"),
+	Unavailable: map[string]bool{"OUT-OF-STOCK": true},
 }
 
-func (r *memRepo) Insert(_ context.Context, o *order.Order) error {
-	o.ID = len(r.orders) + 1
-	o.Version = 1
-	o.CreatedAt, o.UpdatedAt = time.Now(), time.Now()
-	c := *o
-	r.orders[o.ID] = &c
-	return nil
-}
-
-func (r *memRepo) Get(_ context.Context, id int, customerID string) (*order.Order, error) {
-	o, ok := r.orders[id]
-	if !ok || (customerID != "" && o.CustomerID != customerID) {
-		return nil, apperror.NotFound("Order", id)
-	}
-	c := *o
-	return &c, nil
-}
-
-func (r *memRepo) List(_ context.Context, customerID string, _ paging.Request) ([]order.Order, int64, error) {
-	var out []order.Order
-	for _, o := range r.orders {
-		if o.CustomerID == customerID {
-			out = append(out, *o)
-		}
-	}
-	return out, int64(len(out)), nil
-}
-
-// ListAll serves ids below the cursor, newest first, like the keyset query.
-func (r *memRepo) ListAll(_ context.Context, page paging.CursorRequest) ([]order.Order, error) {
-	var out []order.Order
-	for id := len(r.orders); id >= 1 && len(out) < page.Fetch(); id-- {
-		if page.After == 0 || int64(id) < page.After {
-			out = append(out, *r.orders[id])
-		}
-	}
-	return out, nil
-}
-
-func (r *memRepo) UpdateStatus(_ context.Context, o *order.Order) error {
-	r.orders[o.ID].Status = o.Status
-	return nil
-}
-
-func (r *memRepo) CancelPendingOlderThan(context.Context, time.Time, int) ([]int, error) {
-	return nil, nil
-}
-
-type passTransactor struct{}
-
-func (passTransactor) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	return fn(ctx)
-}
-
-func (passTransactor) AfterCommit(ctx context.Context, fn func(ctx context.Context)) { fn(ctx) }
-
-// okInventory prices everything at 19.99 and knows OUT-OF-STOCK as unavailable.
-type okInventory struct{}
-
-func (okInventory) Quote(_ context.Context, sku string, _ int) (order.Quote, error) {
-	return order.Quote{Available: sku != "OUT-OF-STOCK", UnitPrice: decimal.RequireFromString("19.99")}, nil
-}
-
-type nopPublisher struct{}
-
-func (nopPublisher) Publish(context.Context, messaging.Event) error { return nil }
+var rateLimits = middleware.RateLimitConfig{Enabled: true, Global: "global", Policies: map[string]middleware.RateLimitPolicy{
+	"global": {Requests: 1000, Window: time.Minute, PartitionBy: "caller"},
+	"writes": {Requests: 1000, Window: time.Minute, PartitionBy: "caller"},
+}}
 
 func testServer(t *testing.T) http.Handler {
 	t.Helper()
@@ -105,18 +43,14 @@ func testServer(t *testing.T) http.Handler {
 	cfg.Server.RequestTimeout = 5 * time.Second
 	cfg.Server.MaxBodyBytes = 1 << 20
 	cfg.HTTP.ProblemTypeBaseURI = "urn:msvc:error:"
-	cfg.HTTP.RateLimiting = middleware.RateLimitConfig{Enabled: true, Global: "global", Policies: map[string]middleware.RateLimitPolicy{
-		"global": {Requests: 1000, Window: time.Minute, PartitionBy: "caller"},
-		"writes": {Requests: 1000, Window: time.Minute, PartitionBy: "caller"},
-	}}
+	cfg.HTTP.RateLimiting = rateLimits
 	cfg.Auth = auth.Config{Issuer: "user-svc", SigningKey: base64.StdEncoding.EncodeToString([]byte("dev-only-access-token-key-32byte")),
 		DevHeaders: auth.DevHeadersConfig{Enabled: true}}
 	validator, err := auth.NewValidator(cfg.Auth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := cache.New(cache.Config{DefaultTTL: time.Minute, LocalTTL: time.Minute, LocalMaxEntries: 10}, nil, quiet)
-	svc := order.NewService(&memRepo{orders: map[int]*order.Order{}}, passTransactor{}, okInventory{}, nopPublisher{}, c, quiet)
+	svc, _, _ := ordertest.NewService(testInventory)
 	return NewRouter(Deps{
 		Config:      cfg,
 		Log:         quiet,
@@ -155,7 +89,7 @@ var consumer = map[string]string{auth.HeaderDevSubject: "1", auth.HeaderDevRealm
 func TestOperationalEndpointsLiveOnlyOnTheAdminListener(t *testing.T) {
 	registry := health.New(time.Second)
 	registry.MarkStarted()
-	admin := AdminRouter(registry, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	admin := httpserver.AdminHandler(registry, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("# metrics\n"))
 	}))
 	api := testServer(t)
@@ -185,6 +119,23 @@ func TestAuthenticationAndPlanes(t *testing.T) {
 	noScope := map[string]string{auth.HeaderDevSubject: "1", auth.HeaderDevRealm: auth.RealmBackOffice}
 	if p := problem(t, call(h, http.MethodGet, "/api/v1/backoffice/orders", "", noScope)); p.Status != 403 {
 		t.Fatalf("scope enforced: %+v", p)
+	}
+}
+
+// The handlers never dereference a missing principal: a route mounted without RequireRealm by
+// mistake answers 401 instead of panicking.
+func TestHandlersRefuseARequestWithoutAPrincipal(t *testing.T) {
+	svc, _, _ := ordertest.NewService(testInventory)
+	routes := NewOrdersHandler(svc).ConsumerRoutes(middleware.NewRateLimiter(rateLimits, quiet))
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodPost, "/", `{"items":[{"sku":"A","quantity":1}]}`},
+		{http.MethodGet, "/", ""},
+		{http.MethodGet, "/1", ""},
+		{http.MethodDelete, "/1", ""},
+	} {
+		if p := problem(t, call(routes, tc.method, tc.path, tc.body, nil)); p.Status != 401 || p.ErrorCode != "UNAUTHORIZED" {
+			t.Errorf("%s %s: %+v", tc.method, tc.path, p)
+		}
 	}
 }
 
@@ -241,6 +192,26 @@ func TestOrderFlow(t *testing.T) {
 	}
 }
 
+// What api/openapi.yaml says about page, pageSize and limit: an out-of-range NUMBER is clamped
+// (below 1 is the default, above the maximum is the maximum); a value that is not an integer is
+// a 400 naming the parameter — a typo must not silently read as the first page.
+func TestPageSizesAreClampedAndNonNumbersRefused(t *testing.T) {
+	h := testServer(t)
+	var page paging.Result[OrderResponse]
+	rec := call(h, http.MethodGet, "/api/v1/orders?page=0&pageSize=999", "", consumer)
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || rec.Code != 200 || page.Page != 1 || page.PageSize != paging.MaxPageSize {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	operator := map[string]string{auth.HeaderDevSubject: "9", auth.HeaderDevRealm: auth.RealmBackOffice, auth.HeaderDevScopes: ScopeOrdersRead}
+	p := problem(t, call(h, http.MethodGet, "/api/v1/backoffice/orders?limit=abc", "", operator))
+	if p.Status != 400 || p.ErrorCode != "VALIDATION_FAILED" || len(p.Errors["limit"]) == 0 {
+		t.Fatalf("a limit that is not a number is refused, naming it: %+v", p)
+	}
+	if p := problem(t, call(h, http.MethodGet, "/api/v1/orders?page=1.5", "", consumer)); p.Status != 400 || len(p.Errors["page"]) == 0 {
+		t.Fatalf("a page that is not an integer is refused, naming it: %+v", p)
+	}
+}
+
 func TestErrorContract(t *testing.T) {
 	h := testServer(t)
 	p := problem(t, call(h, http.MethodPost, "/api/v1/orders", `{"items":[{"sku":"","quantity":0}]}`, consumer))
@@ -262,6 +233,26 @@ func TestErrorContract(t *testing.T) {
 	p = problem(t, call(h, http.MethodPost, "/api/v1/orders", `{"items":`, consumer))
 	if p.Status != 400 || p.ErrorCode != "BAD_REQUEST" {
 		t.Fatalf("malformed JSON: %+v", p)
+	}
+}
+
+// The validation boundary (CreateOrderRequest): a well-formed body that breaks a rule of the
+// order is a 422 with the order's code, not a 400 from the struct tags.
+func TestOrderRulesAnswer422(t *testing.T) {
+	h := testServer(t)
+	p := problem(t, call(h, http.MethodPost, "/api/v1/orders", `{"items":[]}`, consumer))
+	if p.Status != 422 || p.ErrorCode != order.CodeItemsRequired {
+		t.Fatalf("no items: %+v", p)
+	}
+	item := `{"sku":"A","quantity":1}`
+	tooMany := `{"items":[` + strings.Repeat(item+",", order.MaxItems) + item + `]}`
+	p = problem(t, call(h, http.MethodPost, "/api/v1/orders", tooMany, consumer))
+	if p.Status != 422 || p.ErrorCode != order.CodeItemInvalid {
+		t.Fatalf("too many items: %+v", p)
+	}
+	p = problem(t, call(h, http.MethodPost, "/api/v1/orders", `{}`, consumer))
+	if p.Status != 400 || p.ErrorCode != "VALIDATION_FAILED" || len(p.Errors["items"]) == 0 {
+		t.Fatalf("a missing items field is the request's shape: %+v", p)
 	}
 }
 

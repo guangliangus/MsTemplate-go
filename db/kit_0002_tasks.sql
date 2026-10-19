@@ -1,4 +1,4 @@
--- 数据库任务队列（pkg/taskqueue 使用；表设计与平台其他服务一致，运维 SQL 通用）。
+-- 数据库任务队列（kit 的 taskqueue 包使用；表设计与平台其他服务一致，运维 SQL 通用）。
 -- 多副本用 FOR UPDATE SKIP LOCKED 抢占，UNIQUE(queue_name, task_id) 保证幂等入队，
 -- attempts 由每次抢占自增（重试预算/退避梯度依据）。幂等，可重复执行。
 

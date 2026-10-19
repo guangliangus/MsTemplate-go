@@ -45,7 +45,7 @@ deploy/grafana/import-alerts.sh --yes            # 默认 folder 是服务名，
 ## 写查询的三个坑
 
 1. **队列和 outbox 的 gauge 用 `max by`，不要 `sum`。** 每个副本上报的都是同一个全局值（fixer 和投递器各自查一次库），两副本 `sum` 直接翻倍。
-2. **选择器用 `job`。** 它是 ServiceMonitor 打的 target label（compose 里是 `msvcservice-api` / `msvcservice-worker`）。服务自己不暴露 `service` 标签，避免和 target label 撞名后被改成 `exported_service` 静默失配。
+2. **选择器用 `job`，而且每条 expr 都要带 `{job=~"msvcservice-.*"}`。** 它是 ServiceMonitor 打的 target label（不设 `jobLabel`，取 Service 名：`<release>-api` / `<release>-worker`；compose 里是 `msvcservice-api` / `msvcservice-worker`，所以 release 名要等于服务名）。集群的 Prometheus 抓所有服务，没有这个选择器，导入的规则会对别的服务报警（`up == 0` 更是对整个集群）。服务自己不暴露 `service` 标签，避免和 target label 撞名后被改成 `exported_service` 静默失配。
 3. **死信按 `reason` 过滤。** `exhausted`（重试用尽，要告警）和 `non_retryable`（handler 主动放弃，日常噪声）量级差很多；任务的 `msvc_tasks_dead_total{reason}` 同理。
 
 ## 自检

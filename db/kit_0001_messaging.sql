@@ -1,4 +1,4 @@
--- 消息可靠性表：Transactional Outbox + Inbox 幂等台账（pkg/messaging 使用）。
+-- 消息可靠性表：Transactional Outbox + Inbox 幂等台账（kit 的 messaging 包使用）。
 -- 表设计与平台其他服务一致：运维 SQL 与 runbook 通用（库本身每个服务各自一套）。
 -- 幂等，可重复执行。
 
@@ -7,29 +7,33 @@
 CREATE TABLE IF NOT EXISTS outbox_messages
 (
     -- ddl-allow: serial-primary-key  flow table: cleanup deletes rows without resetting the sequence, int32 would run out
-    id             BIGSERIAL   NOT NULL,
-    message_id     uuid        NOT NULL,
-    event_name     text        NOT NULL,
-    payload        jsonb       NOT NULL,
-    status         text        NOT NULL,
-    attempts       integer     NOT NULL,
-    occurred_at    TIMESTAMPTZ NOT NULL,
-    published_at   TIMESTAMPTZ NULL,
-    trace_parent   text        NULL,
-    correlation_id text        NULL,
-    last_error     text        NULL,
+    id              BIGSERIAL   NOT NULL,
+    message_id      uuid        NOT NULL,
+    event_name      text        NOT NULL,
+    partition_key   text        NOT NULL DEFAULT '',
+    payload         jsonb       NOT NULL,
+    status          text        NOT NULL,
+    attempts        integer     NOT NULL,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    occurred_at     TIMESTAMPTZ NOT NULL,
+    published_at    TIMESTAMPTZ NULL,
+    trace_parent    text        NULL,
+    correlation_id  text        NULL,
+    last_error      text        NULL,
     CONSTRAINT pk_outbox_messages PRIMARY KEY (id)
 );
 
 COMMENT ON COLUMN outbox_messages.status IS 'PENDING | PUBLISHED | FAILED';
+COMMENT ON COLUMN outbox_messages.partition_key IS '分区键（聚合 id；Kafka 用它保证同一聚合的事件有序，空串表示无键）';
+COMMENT ON COLUMN outbox_messages.next_attempt_at IS '最早可再次投递的时间（被拒后按指数退避推后）';
 COMMENT ON COLUMN outbox_messages.last_error IS '最近一次投递失败的原因（成功后清空）';
 
 CREATE UNIQUE INDEX IF NOT EXISTS ix_outbox_messages_message_id
     ON outbox_messages (message_id);
 
--- 投递器轮询用：WHERE status = 'PENDING' ORDER BY id
+-- 投递器轮询用：WHERE status = 'PENDING' AND next_attempt_at <= now() ORDER BY next_attempt_at, id
 CREATE INDEX IF NOT EXISTS ix_outbox_messages_pending
-    ON outbox_messages (id) WHERE status = 'PENDING';
+    ON outbox_messages (next_attempt_at, id) WHERE status = 'PENDING';
 
 -- 清理用：WHERE status = 'PUBLISHED' AND published_at < cutoff
 CREATE INDEX IF NOT EXISTS ix_outbox_messages_published_at

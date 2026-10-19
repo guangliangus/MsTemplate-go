@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"example.com/msvcservice/internal/order"
-	"example.com/msvcservice/pkg/taskqueue"
+	"github.com/guangliangus/go-msvc-kit/taskqueue"
 )
 
 // PendingOrdersReaper cancels orders that stayed PENDING too long. Recurring: re-armed to

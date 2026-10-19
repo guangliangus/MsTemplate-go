@@ -1,6 +1,7 @@
 # golangci-lint v2 configuration. The thresholds below encode the team's Go standard
 # (Google style plus local rules): 120-column lines, functions under 80 lines, nesting under
-# 4, every switch with a default, errors wrapped and checked, no package importing upward.
+# 4, a default last in every switch that has one (enum switches must be exhaustive), errors wrapped
+# and checked, no package importing upward.
 version: "2"
 
 run:
@@ -38,15 +39,36 @@ linters:
   settings:
     depguard:
       rules:
-        # The kit never imports the service: pkg/ is what will be extracted to a shared module.
-        kit-does-not-import-service:
-          files: ["**/pkg/**"]
+        # The kit is the platform's one set of building blocks; a second router, ORM or logger
+        # beside chi, pgx and slog would split every service that imports it. The same rule as the
+        # kit's .golangci.yml.
+        no-alternative-frameworks:
+          files: ["$all"]
           deny:
-            - pkg: "example.com/msvcservice/internal"
-              desc: "pkg/ must not depend on internal/ (dependency direction)"
-        # The business package imports no driver and no adapter: ports in, implementations beside it.
+            - pkg: "github.com/gin-gonic/gin"
+              desc: "the router is chi"
+            - pkg: "github.com/labstack/echo"
+              desc: "the router is chi"
+            - pkg: "gorm.io/gorm"
+              desc: "data access is pgx with plain SQL"
+            - pkg: "github.com/sirupsen/logrus"
+              desc: "logging is log/slog"
+            - pkg: "go.uber.org/zap"
+              desc: "logging is log/slog"
+        # The business packages import no driver and no adapter: ports in, implementations beside
+        # them. Matched by exclusion so the rule survives renaming internal/order or adding a second
+        # context beside it: everything under internal/ EXCEPT the packages allowed to see drivers
+        # or adapters — the composition root and the adapters themselves ("!" negates a glob; a
+        # file is covered when it matches a positive glob and no negated one). A new adapter
+        # package (a second downstream client, another store) goes on this list; a new business
+        # context, consumer or task host needs nothing — it is covered as it should be.
         order-stays-pure:
-          files: ["**/internal/order/**"]
+          files:
+            - "**/internal/**"
+            - "!**/internal/app/**"
+            - "!**/internal/httpapi/**"
+            - "!**/internal/postgres/**"
+            - "!**/internal/inventory/**"
           deny:
             - pkg: "example.com/msvcservice/internal/postgres"
               desc: "order declares the Repository port; internal/postgres implements it"
@@ -59,6 +81,8 @@ linters:
             - pkg: "github.com/jackc/pgx"
               desc: "no database driver in the business package"
             - pkg: "github.com/rabbitmq/amqp091-go"
+              desc: "no broker client in the business package"
+            - pkg: "github.com/twmb/franz-go"
               desc: "no broker client in the business package"
             - pkg: "github.com/go-chi"
               desc: "no router in the business package"
@@ -131,4 +155,5 @@ formatters:
     - goimports
   settings:
     goimports:
-      local-prefixes: ["example.com/msvcservice"]
+      # The service and the platform kit form one import group, after the third-party one.
+      local-prefixes: ["example.com/msvcservice", "github.com/guangliangus/go-msvc-kit"]

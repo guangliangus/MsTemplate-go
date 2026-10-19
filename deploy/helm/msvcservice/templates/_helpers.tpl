@@ -39,6 +39,23 @@ app.kubernetes.io/component: worker
 {{- end -}}
 
 {{/*
+The Secret every container reads through envFrom: secret.existingName when the operator keeps it
+under another name, else <release>-secrets (rendered by the chart with secret.create, or created
+by the operator before the first install).
+*/}}
+{{- define "msvc.secretName" -}}
+{{- .Values.secret.existingName | default (printf "%s-secrets" (include "msvc.fullname" .)) -}}
+{{- end -}}
+
+{{/*
+True when the chart renders the app Secret itself (secret.create and no existingName): the
+deployments then hash it into checksum/secret so a changed value rolls the pods.
+*/}}
+{{- define "msvc.secretManaged" -}}
+{{- if and .Values.secret.create (not .Values.secret.existingName) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 The shared container spec: ports, probes, security context, env from the ConfigMap and the Secret.
 "port" is the API listener (the api container only); every container has the admin listener, which
 serves the probes and /metrics and is never behind the ingress.
@@ -60,7 +77,7 @@ envFrom:
   - configMapRef:
       name: {{ include "msvc.fullname" .root }}-config
   - secretRef:
-      name: {{ include "msvc.fullname" .root }}-secrets
+      name: {{ include "msvc.secretName" .root }}
   {{- range .root.Values.secret.optionalRefs }}
   - secretRef:
       name: {{ . }}

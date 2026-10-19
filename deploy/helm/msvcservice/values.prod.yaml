@@ -3,6 +3,14 @@ config:
   # 10% head sampling — 100% tracing is a cost hole at production traffic.
   TELEMETRY__TRACE_SAMPLE_RATIO: "0.1"
 
+# No chart-rendered Secret in production: the operator (or ExternalSecrets / Vault) creates
+# <release>-secrets — msvcservice-secrets for the pipeline's release name — with POSTGRES__DSN,
+# RABBITMQ__URL and AUTH__SIGNING_KEY before the first `helm upgrade --install`, or names the
+# Secret it manages in secret.existingName. Repeated from the base on purpose (see values.dev.yaml).
+secret:
+  create: false
+  existingName: ""
+
 api:
   hpa:
     minReplicas: 2

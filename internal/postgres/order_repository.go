@@ -13,10 +13,10 @@ import (
 	"github.com/shopspring/decimal"
 
 	"example.com/msvcservice/internal/order"
-	"example.com/msvcservice/pkg/actor"
-	"example.com/msvcservice/pkg/apperror"
-	"example.com/msvcservice/pkg/paging"
-	kitpg "example.com/msvcservice/pkg/postgres"
+	"github.com/guangliangus/go-msvc-kit/actor"
+	"github.com/guangliangus/go-msvc-kit/apperror"
+	"github.com/guangliangus/go-msvc-kit/paging"
+	kitpg "github.com/guangliangus/go-msvc-kit/postgres"
 )
 
 // OrderRepository implements order.Repository.

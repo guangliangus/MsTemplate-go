@@ -8,15 +8,21 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"example.com/msvcservice/pkg/apperror"
-	"example.com/msvcservice/pkg/cache"
-	"example.com/msvcservice/pkg/messaging"
-	"example.com/msvcservice/pkg/money"
-	"example.com/msvcservice/pkg/paging"
+	"github.com/guangliangus/go-msvc-kit/apperror"
+	"github.com/guangliangus/go-msvc-kit/cache"
+	"github.com/guangliangus/go-msvc-kit/messaging"
+	"github.com/guangliangus/go-msvc-kit/money"
+	"github.com/guangliangus/go-msvc-kit/paging"
 )
 
 const (
+	// reapBatchSize bounds one CancelPendingOlderThan statement, so the reaper never locks a huge
+	// set of rows in one UPDATE.
 	reapBatchSize = 500
+	// maxReapBatches bounds one ReapPending run: a backlog above reapBatchSize drains over several
+	// batches within the run, but a run never holds the task slot indefinitely; the next firing
+	// continues where this one stopped.
+	maxReapBatches = 20
 	// maxConcurrentQuotes bounds the inventory calls one order makes at once: up to MaxItems lines
 	// priced in parallel, without one large order opening a hundred connections to the downstream.
 	maxConcurrentQuotes = 8
@@ -41,8 +47,9 @@ func NewService(repo Repository, tx Transactor, inventory InventoryClient, publi
 	return &Service{repo: repo, tx: tx, inventory: inventory, publisher: publisher, cache: c, log: log}
 }
 
-// Create validates the request, prices every line with the inventory service (which also says
-// whether it can be sold) and commits the order and its CreatedEvent together.
+// Create checks the lines, prices every one with the inventory service (which also says whether it
+// can be sold) and commits the order and its CreatedEvent together. The line rules run once, before
+// any downstream call; newChecked then adds only what the prices can tell.
 func (s *Service) Create(ctx context.Context, customerID string, lines []Line) (*Order, error) {
 	if err := CheckLines(customerID, lines); err != nil {
 		return nil, err
@@ -51,7 +58,7 @@ func (s *Service) Create(ctx context.Context, customerID string, lines []Line) (
 	if err != nil {
 		return nil, err
 	}
-	o, err := New(customerID, items)
+	o, err := newChecked(customerID, items)
 	if err != nil {
 		return nil, err
 	}
@@ -171,16 +178,26 @@ func (s *Service) Cancel(ctx context.Context, id int, customerID string) error {
 }
 
 // ReapPending cancels orders that stayed PENDING longer than timeout; the recurring task calls it.
-// A bulk status change is still a status change: every cancelled order leaves the cache.
+// The cutoff is taken once per run, so every batch of the run agrees on it. A backlog above
+// reapBatchSize drains batch by batch until a short batch comes back, at most maxReapBatches per
+// run. A bulk status change is still a status change: every cancelled order leaves the cache.
 func (s *Service) ReapPending(ctx context.Context, timeout time.Duration) (int64, error) {
-	ids, err := s.repo.CancelPendingOlderThan(ctx, time.Now().Add(-timeout), reapBatchSize)
-	if err != nil {
-		return 0, err
+	cutoff := time.Now().Add(-timeout)
+	var total int64
+	for range maxReapBatches {
+		ids, err := s.repo.CancelPendingOlderThan(ctx, cutoff, reapBatchSize)
+		if err != nil {
+			return total, err
+		}
+		for _, id := range ids {
+			s.invalidateAfterCommit(ctx, id)
+		}
+		total += int64(len(ids))
+		if len(ids) < reapBatchSize {
+			break
+		}
 	}
-	for _, id := range ids {
-		s.invalidateAfterCommit(ctx, id)
-	}
-	return int64(len(ids)), nil
+	return total, nil
 }
 
 // invalidateAfterCommit drops the cached order once the change is committed. Dropping it before

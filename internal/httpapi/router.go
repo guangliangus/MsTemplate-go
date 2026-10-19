@@ -1,23 +1,23 @@
 // Package httpapi is the service's HTTP surface: the API router with the platform's middleware in
-// its load-bearing order, the API docs, the handlers and their wire types, and — on its own
-// listener — the admin router with the probes and metrics. Handlers return errors; nothing here
-// writes a problem by hand.
+// its load-bearing order, the API docs mount, the handlers and their wire types. The probes and
+// metrics are the kit's (httpserver.AdminHandler on the admin listener). Handlers return errors;
+// nothing here writes a problem by hand.
 package httpapi
 
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"example.com/msvcservice/internal/config"
 	"example.com/msvcservice/internal/order"
-	"example.com/msvcservice/pkg/auth"
-	"example.com/msvcservice/pkg/health"
-	"example.com/msvcservice/pkg/httpx"
-	"example.com/msvcservice/pkg/idempotency"
-	"example.com/msvcservice/pkg/middleware"
+	"github.com/guangliangus/go-msvc-kit/auth"
+	"github.com/guangliangus/go-msvc-kit/httpx"
+	"github.com/guangliangus/go-msvc-kit/idempotency"
+	"github.com/guangliangus/go-msvc-kit/middleware"
 )
 
 // Deps is everything the API router needs.
@@ -32,25 +32,18 @@ type Deps struct {
 	OpenAPI     []byte
 }
 
-// AdminRouter builds the admin listener's surface (server.admin_addr): the three probes and
-// /metrics, unauthenticated and never behind the ingress. Both host modes serve it; a worker
-// serves nothing else.
-func AdminRouter(h *health.Registry, metrics http.Handler) http.Handler {
-	r := chi.NewRouter()
-	r.Method(http.MethodGet, "/health/startup", h.Startup())
-	r.Method(http.MethodGet, "/health/live", h.Live())
-	r.Method(http.MethodGet, "/health/ready", h.Ready())
-	r.Method(http.MethodGet, "/metrics", metrics)
-	return r
-}
-
-// NewRouter builds the API listener's handler (server.addr). The probes and metrics are not here:
-// whatever the ingress routes to this listener can never reach them.
+// NewRouter builds the API listener's handler (server.addr). The probes and metrics are not here
+// (httpserver.AdminHandler serves them on the admin listener): whatever the ingress routes to this
+// listener can never reach them.
 func NewRouter(d Deps) http.Handler {
 	cfg := d.Config
 	root := chi.NewRouter()
-	if cfg.HTTP.DocsEnabled {
-		mountDocs(root, d.OpenAPI)
+	// The API reference is a development convenience: like the header identities it answers only
+	// in the development environment, whatever the configuration says, so a docs_enabled that leaks
+	// into a cluster config map serves nothing. Outside the middleware chain on purpose — a static
+	// page and the document need no auth, idempotency or body cap.
+	if cfg.HTTP.DocsEnabled && strings.EqualFold(cfg.Environment, auth.DevelopmentEnvironment) {
+		root.Mount("/docs", httpx.Docs(d.OpenAPI))
 	}
 
 	limiter := middleware.NewRateLimiter(cfg.HTTP.RateLimiting, d.Log)
@@ -87,7 +80,7 @@ func NewRouter(d Deps) http.Handler {
 		r.Use(middleware.RequestTimeout(cfg.Server.RequestTimeout))
 		r.Use(middleware.MaxBodyBytes(cfg.Server.MaxBodyBytes))
 		r.Use(middleware.CORS(cfg.HTTP.CORS))
-		r.Use(auth.Authenticate(d.Auth, d.DevHeaders, d.Log))
+		r.Use(auth.Authenticate(d.Log, d.Auth, d.DevHeaders))
 		r.Use(limiter.Global())
 		r.Use(middleware.Idempotency(cfg.HTTP.Idempotency, d.Idempotency, d.Log))
 

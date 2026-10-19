@@ -56,6 +56,19 @@ Content-Type: application/json
 
 { "items": [ { "sku": "", "quantity": 0 } ] }
 
+### a well-formed body that breaks a rule of the order → 422 ORDER_ITEMS_REQUIRED (ORDER_ITEM_INVALID past 100 items)
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+{{consumer}}
+{{realm}}
+
+{ "items": [] }
+
+### an id that is not a positive integer → 400 BAD_REQUEST
+GET {{host}}/api/v1/orders/abc
+{{consumer}}
+{{realm}}
+
 ### business rule → 422 ORDER_ITEM_UNAVAILABLE (WireMock stub)
 POST {{host}}/api/v1/orders
 Content-Type: application/json

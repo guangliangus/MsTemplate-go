@@ -6,7 +6,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"example.com/msvcservice/pkg/paging"
+	"github.com/guangliangus/go-msvc-kit/paging"
 )
 
 // Repository is the persistence port; internal/postgres implements it. Only interfaces for things
@@ -30,7 +30,7 @@ type Repository interface {
 }
 
 // Transactor runs fn inside one database transaction carried on the context, so every repository
-// call made with that context joins it; pkg/postgres.DB satisfies it.
+// call made with that context joins it; the kit's postgres.DB satisfies it.
 type Transactor interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
 	// AfterCommit runs fn once the transaction on ctx has committed (at once when there is none):

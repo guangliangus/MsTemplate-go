@@ -19,14 +19,18 @@ server:
   idle_timeout: 120s
   # The whole stop budget after SIGTERM, shared by every component in stop order. The pod's
   # terminationGracePeriodSeconds starts counting BEFORE preStop, so it must cover preStop (5s) +
-  # this + the telemetry flush (5s) + a margin: the chart sets 45s.
-  shutdown_timeout: 25s
+  # this + the telemetry flush (5s) + a margin: the chart sets 50s. The drains declared below add
+  # up in stop order — api 12s, tasks 5s, kafka consumers 5s, rabbitmq consumers 5s: 27s — and must stay below
+  # it, leaving the outbox, the connections and the admin listener the rest (config_test checks).
+  shutdown_timeout: 30s
   # The API listener's share of shutdown_timeout for in-flight requests (must be below it): the
   # consumers, the task runner and the outbox stop after it and need the rest.
-  drain_timeout: 15s
+  drain_timeout: 12s
   # Per-request deadline handlers see on their context; honoured work answers 504 REQUEST_TIMEOUT.
   request_timeout: 30s
   max_body_bytes: 1048576
+  # Request header cap for both listeners; 0 = net/http's default (1 MiB).
+  max_header_bytes: 0
 
 http:
   forwarded_headers:
@@ -73,15 +77,19 @@ logging:
 
 telemetry:
   # Traces are pushed here over OTLP/gRPC (Jaeger locally, the collector in production); empty
-  # disables the exporter. Metrics are never pushed: Prometheus scrapes /metrics.
-  otlp_endpoint: http://localhost:4317
+  # disables the exporter. Metrics are never pushed: Prometheus scrapes /metrics. The development
+  # overlay points at the compose Jaeger; the chart sets the cluster collector.
+  otlp_endpoint: ""
   # Head sampling, parent-based. 1.0 locally; the production chart sets 0.1.
   trace_sample_ratio: 1.0
   # Longest span attribute value in bytes (a SQL statement is one attribute); 0 = unlimited.
   attribute_value_length_limit: 2048
 
 postgres:
-  dsn: postgres://msvc:msvc@localhost:5432/msvcservice?sslmode=disable
+  # Required; no default on purpose. This file is the PRODUCTION baseline (APP_ENV defaults to
+  # production), so a deployment that forgot its Secret must refuse to boot rather than start
+  # against a localhost that is not there. The development overlay supplies the compose value.
+  dsn: ""
   max_conns: 16
   min_conns: 2
   max_conn_lifetime: 30m
@@ -101,7 +109,12 @@ postgres:
   slow_query_log_rate: 10
 
 redis:
-  addr: localhost:6379
+  # Required, like postgres.dsn: supplied by the development overlay locally, by the chart's
+  # config map in the cluster. Single node here; a Sentinel or Cluster deployment sets `addrs`
+  # (the sentinels or seed nodes) instead, plus `master_name` for Sentinel — exactly one of the two.
+  addr: ""
+  addrs: []
+  master_name: ""
   username: ""
   password: ""
   db: 0
@@ -121,10 +134,14 @@ cache:
   # L1 lifetime; no replica broadcasts invalidation, so this bounds cross-pod staleness.
   local_ttl: 30s
   local_max_entries: 10000
+  # A cold key is loaded once per replica for every concurrent reader, under its own budget rather
+  # than the first caller's deadline (one caller with 50ms left must not fail the others).
+  load_timeout: 5s
 
 rabbitmq:
   enabled: true
-  url: amqp://guest:guest@localhost:5672/
+  # Required while enabled (validated); from a Secret in the cluster, the overlay locally.
+  url: ""
   exchange: msvc.events
   # quorum (replicated) by default; a queue's type cannot be changed in place.
   queue_type: quorum
@@ -145,10 +162,57 @@ rabbitmq:
   reconnect_delay: 5s
   heartbeat: 10s
 
+# The platform's second bus. Which bus an event lives on is decided per event, here: an event in
+# `events` is published to Kafka and consumed from Kafka, every other event stays on RabbitMQ. The
+# producer and every consumer of an event must agree, so the list moves with the platform's
+# decision, not one service's. Off by default; a service turns it on with its brokers and events.
+kafka:
+  enabled: false
+  # host:port of the bootstrap brokers; required while enabled.
+  brokers: []
+  # Event names that live on Kafka (orders.order-created.v1, ...); must be empty while disabled.
+  events: []
+  # Whether this host runs the Kafka consumers (false on API pods beside a worker deployment).
+  consumers_enabled: true
+  # TLS with the system roots, and SASL (PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512; the password comes
+  # from a Secret as KAFKA__SASL__PASSWORD).
+  tls: false
+  sasl:
+    mechanism: ""
+    username: ""
+    password: ""
+  # Event name → topic, for an event whose topic is not named after it.
+  topics: {}
+  # Failed records go to {group}.retry.N (one topic per delay), then {group}.dlq. A record leaving
+  # its partition for a retry topic loses its place among the later records of its key.
+  retry_delays: [30s, 2m, 10m]
+  # One produce as a whole, until every in-sync replica has it (acks=all, idempotent producer).
+  publish_timeout: 10s
+  # On shutdown in-flight handlers get this long; a cancelled handler's record is not committed
+  # and is consumed again by whichever replica owns the partition next.
+  drain_timeout: 5s
+  # How often readiness (/health/ready, informational) re-checks the brokers.
+  ping_interval: 10s
+  # Where a NEW consumer group starts. earliest: with the inbox deduplicating, replaying is safe and
+  # skipping is not. A group that already committed resumes where it stopped either way.
+  consume_from: earliest
+  # Create the main, retry and dead-letter topics at start when missing (already-existing ones are
+  # left alone). Turn off where topics are provisioned by the platform and the ACLs forbid it.
+  create_topics: true
+  # Partitions / replication factor of topics this service creates; -1 = the broker's default.
+  topic_partitions: -1
+  topic_replication_factor: -1
+  # Records one poll hands to the partition workers.
+  max_poll_records: 100
+
 outbox:
   poll_interval: 2s
   batch_size: 50
   max_attempts: 5
+  # A row the broker REFUSED (not a broker outage, which spends no attempt) waits
+  # retry_base_delay, doubling per attempt up to retry_max_delay, before it is claimed again.
+  retry_base_delay: 5s
+  retry_max_delay: 5m
   # false keeps PUBLISHED outbox rows and processed inbox rows forever (an event journal).
   cleanup_enabled: true
   retention: 168h
@@ -178,7 +242,8 @@ tasks:
     pending-orders-reaper: 1m
   # tasks.cron.<name>: { expression, time_zone, misfire: fire_once_now|skip|catch_up }
   cron: {}
-  # tasks.queues.<queue>: { max_workers, max_attempts, short_poll_interval, long_poll_interval }
+  # tasks.queues.<queue>: { max_workers, max_attempts, short_poll_interval, long_poll_interval,
+  # task_timeout } — task_timeout per queue must also stay strictly below stale_after.
   queues: {}
 
 auth:
@@ -200,7 +265,9 @@ auth:
 # Named downstream clients, called by Kubernetes service name. base_url must end with '/'.
 service_clients:
   inventory:
-    base_url: http://localhost:8089/
+    # Empty = not configured: every call answers 500 NOT_CONFIGURED naming this section, so a
+    # downstream nobody wired breaks only itself. The overlay points at the compose WireMock.
+    base_url: ""
     # Budget for the whole call, retries included.
     timeout: 5s
     retry: { max_attempts: 3, base_delay: 200ms, max_delay: 2s }

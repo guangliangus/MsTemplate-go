@@ -11,12 +11,13 @@
 package order
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
 
-	"example.com/msvcservice/pkg/apperror"
+	"github.com/guangliangus/go-msvc-kit/apperror"
 )
 
 // Status is the order's lifecycle state; the status column is the soft-delete marker too.
@@ -40,7 +41,9 @@ const (
 	CodeTotalTooLarge   = "ORDER_TOTAL_TOO_LARGE"
 )
 
-// MaxItems bounds one order.
+// MaxItems bounds the lines one order may carry. It is a rule of the order, not of the wire format:
+// CheckLines enforces it with a 422 whichever caller built the lines, and the HTTP request type
+// deliberately carries no copy of it (internal/httpapi.CreateOrderRequest).
 const MaxItems = 100
 
 // MaxAmount is the largest amount an order stores: total_amount is numeric(10,2). Refusing it here
@@ -65,7 +68,7 @@ func CheckLines(customerID string, lines []Line) error {
 		return apperror.DomainRule(CodeItemsRequired, "An order needs at least one item.")
 	}
 	if len(lines) > MaxItems {
-		return apperror.DomainRule(CodeItemInvalid, "An order may carry at most 100 items.")
+		return apperror.DomainRule(CodeItemInvalid, "An order may carry at most "+strconv.Itoa(MaxItems)+" items.")
 	}
 	for _, l := range lines {
 		if strings.TrimSpace(l.SKU) == "" {
@@ -107,7 +110,8 @@ type Order struct {
 	Version uint32
 }
 
-// New validates the invariants and builds a PENDING order from priced items.
+// New validates the invariants and builds a PENDING order from priced items: the line rules
+// (CheckLines) and then what only the prices can tell (newChecked).
 func New(customerID string, items []Item) (*Order, error) {
 	lines := make([]Line, len(items))
 	for i, item := range items {
@@ -116,6 +120,13 @@ func New(customerID string, items []Item) (*Order, error) {
 	if err := CheckLines(customerID, lines); err != nil {
 		return nil, err
 	}
+	return newChecked(customerID, items)
+}
+
+// newChecked builds the order from items whose lines CheckLines has already accepted — the service
+// runs the line rules once, before it prices anything — and checks what only a price can violate:
+// no negative price, the total within MaxAmount.
+func newChecked(customerID string, items []Item) (*Order, error) {
 	total := decimal.Zero
 	for _, item := range items {
 		if item.UnitPrice.IsNegative() {

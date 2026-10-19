@@ -3,8 +3,9 @@
 // start order and runs the host in one of two modes with the same binary and image:
 //
 //	serve   the API listener plus, by configuration, the consumers, the outbox dispatcher and the
-//	        task runner (tasks.max_workers=0 and rabbitmq.consumers_enabled=false turn those off on
-//	        API pods that have a worker deployment beside them)
+//	        task runner (tasks.max_workers=0, rabbitmq.consumers_enabled=false and
+//	        kafka.consumers_enabled=false turn those off on API pods that have a worker deployment
+//	        beside them)
 //	worker  the consumers, the dispatcher and the task runner, and no API listener
 //
 // Both modes serve the probes and /metrics on the admin listener (server.admin_addr).
@@ -18,26 +19,24 @@ import (
 	"time"
 
 	"example.com/msvcservice/internal/config"
-	"example.com/msvcservice/internal/consumers"
 	"example.com/msvcservice/internal/httpapi"
 	"example.com/msvcservice/internal/inventory"
 	"example.com/msvcservice/internal/order"
 	"example.com/msvcservice/internal/postgres"
 	"example.com/msvcservice/internal/tasks"
-	"example.com/msvcservice/pkg/auth"
-	"example.com/msvcservice/pkg/cache"
-	"example.com/msvcservice/pkg/health"
-	"example.com/msvcservice/pkg/httpclient"
-	"example.com/msvcservice/pkg/httpserver"
-	"example.com/msvcservice/pkg/httpx"
-	"example.com/msvcservice/pkg/lifecycle"
-	"example.com/msvcservice/pkg/logging"
-	"example.com/msvcservice/pkg/messaging"
-	kitpg "example.com/msvcservice/pkg/postgres"
-	"example.com/msvcservice/pkg/rabbitmq"
-	"example.com/msvcservice/pkg/redisx"
-	"example.com/msvcservice/pkg/taskqueue"
-	"example.com/msvcservice/pkg/telemetry"
+	"github.com/guangliangus/go-msvc-kit/auth"
+	"github.com/guangliangus/go-msvc-kit/cache"
+	"github.com/guangliangus/go-msvc-kit/health"
+	"github.com/guangliangus/go-msvc-kit/httpclient"
+	"github.com/guangliangus/go-msvc-kit/httpserver"
+	"github.com/guangliangus/go-msvc-kit/httpx"
+	"github.com/guangliangus/go-msvc-kit/lifecycle"
+	"github.com/guangliangus/go-msvc-kit/logging"
+	"github.com/guangliangus/go-msvc-kit/messaging"
+	kitpg "github.com/guangliangus/go-msvc-kit/postgres"
+	"github.com/guangliangus/go-msvc-kit/redisx"
+	"github.com/guangliangus/go-msvc-kit/taskqueue"
+	"github.com/guangliangus/go-msvc-kit/telemetry"
 )
 
 // Mode is the host shape.
@@ -58,6 +57,8 @@ const (
 	// closeTimeout bounds releasing each connection pool after the components stopped: a component
 	// abandoned by the shutdown budget may still hold a connection, and pgxpool.Close waits for it.
 	closeTimeout = 3 * time.Second
+	// poolCloseTimeout is the same bound as closeTimeout, named for the closers list.
+	poolCloseTimeout = closeTimeout
 )
 
 // Run builds and runs the host until ctx is cancelled (SIGTERM) or a component fails.
@@ -95,24 +96,29 @@ func Run(ctx context.Context, mode Mode, version string, openAPI []byte) error {
 	if err != nil {
 		return err
 	}
-	defer deps.close(log)
+	defer deps.closers.Close()
 
 	// Readiness gates only on what THIS pod cannot answer without (docs/architecture.md, failure
 	// semantics). Redis and the broker are shared by every replica and degraded around — the cache
 	// falls back to the database, the outbox holds events — so their outage is reported, not
 	// turned into every pod leaving the Service at once.
 	registry := health.New(healthCheckTimeout)
+	defer registry.Close()
 	registry.AddReadiness("postgres", deps.db.Ping)
 	registry.AddInformational("redis", deps.rdb.Ping)
 
+	// Every component declares its drain so the group can tell at startup, not at the first
+	// SIGTERM, when the declared drains add up to the whole budget and leave the last ones nothing.
 	group := lifecycle.NewGroup(log, cfg.Server.ShutdownTimeout)
 	// Registered first so it stops LAST: the probes keep answering (readiness 503 while draining)
 	// and the metrics stay scrapeable until everything else has stopped.
-	group.Add("admin", httpserver.NewAdmin(cfg.Server, httpapi.AdminRouter(registry, tel.MetricsHandler()), log))
+	group.Add("admin", httpserver.NewAdmin(cfg.Server, httpserver.AdminHandler(registry, tel.MetricsHandler()), log))
 	group.Add("health", lifecycle.RunnerFunc(func(ctx context.Context) error {
 		return registry.Watch(ctx, healthWatchInterval)
 	}))
-	deps.registerMessaging(cfg, group, registry, log)
+	if err := deps.registerMessaging(cfg, group, registry, log); err != nil {
+		return err
+	}
 	deps.registerTasks(cfg, group, log)
 
 	if mode == ModeServe {
@@ -128,7 +134,7 @@ func Run(ctx context.Context, mode Mode, version string, openAPI []byte) error {
 		})
 		// Registered last so it stops FIRST: readiness fails, the endpoint controller stops routing,
 		// in-flight requests drain within server.drain_timeout, and only then do the workers stop.
-		group.Add("api", httpserver.New(cfg.Server, handler, log))
+		group.Add("api", httpserver.New(cfg.Server, handler, log), lifecycle.WithDrain(cfg.Server.DrainTimeout))
 	}
 
 	// Readiness answers 503 from the moment shutdown is requested. Stopping the hook on return
@@ -147,44 +153,19 @@ type dependencies struct {
 	devHeaders    *auth.DevHeaders
 	orders        *order.Service
 	mode          string
-	closers       []closer
-}
-
-type closer struct {
-	name string
-	fn   func()
-}
-
-// close releases the resources in reverse order, each within closeTimeout: past it the process
-// exits without waiting, rather than overrunning the pod's grace period into a SIGKILL.
-func (d *dependencies) close(log *slog.Logger) {
-	for i := len(d.closers) - 1; i >= 0; i-- {
-		c := d.closers[i]
-		done := make(chan struct{})
-		go func() {
-			c.fn()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(closeTimeout):
-			log.Warn("closing a resource timed out; exiting without it", slog.String("resource", c.name),
-				slog.Duration("timeout", closeTimeout))
-		}
-	}
-}
-
-func (d *dependencies) onClose(name string, fn func()) {
-	d.closers = append(d.closers, closer{name: name, fn: fn})
+	// closers releases the pools in reverse order once the components stopped, each within
+	// closeTimeout: past it the process exits without waiting, rather than overrunning the pod's
+	// grace period into a SIGKILL.
+	closers *lifecycle.Closers
 }
 
 // build opens the resources and wires the use cases. A failure part-way closes whatever was already
 // opened; after a success, Run owns the close.
 func build(ctx context.Context, cfg *config.Config, mode Mode, log *slog.Logger) (_ *dependencies, err error) {
-	d := &dependencies{mode: string(mode)}
+	d := &dependencies{mode: string(mode), closers: lifecycle.NewClosers(log, poolCloseTimeout)}
 	defer func() {
 		if err != nil {
-			d.close(log)
+			d.closers.Close()
 		}
 	}()
 
@@ -193,14 +174,14 @@ func build(ctx context.Context, cfg *config.Config, mode Mode, log *slog.Logger)
 		return nil, err
 	}
 	d.db = db
-	d.onClose("postgres", db.Close)
+	d.closers.Add("postgres", db.Close)
 
 	rdb, err := redisx.Open(cfg.Redis, log)
 	if err != nil {
 		return nil, err
 	}
 	d.rdb = rdb
-	d.onClose("redis", func() { _ = rdb.Close() })
+	d.closers.Add("redis", func() { _ = rdb.Close() })
 
 	d.errorWriter = httpx.NewErrorWriter(cfg.HTTP.ProblemTypeBaseURI, log)
 	d.errorWriter.Mappers = append(d.errorWriter.Mappers, kitpg.ErrorMapper)
@@ -233,50 +214,17 @@ func build(ctx context.Context, cfg *config.Config, mode Mode, log *slog.Logger)
 	return d, nil
 }
 
-// registerMessaging wires the broker connection, the outbox dispatcher and the consumers. Start
-// order is stop order reversed: the connection stops last, so draining consumers can still nack.
-// The broker is informational for readiness: while it is away the outbox holds the events and the
-// consumers reconnect on their own.
-func (d *dependencies) registerMessaging(cfg *config.Config, group *lifecycle.Group,
-	registry *health.Registry, log *slog.Logger) {
-	if !cfg.RabbitMQ.Enabled {
-		log.Warn("rabbitmq is disabled: outbox rows will accumulate as PENDING until a transport is enabled")
-		return
-	}
-	conn := rabbitmq.NewConnection(cfg.RabbitMQ.Config, cfg.Service.Name+"-"+d.mode, log)
-	registry.AddInformational("rabbitmq", conn.Ping)
-	group.Add("rabbitmq", conn)
-
-	publisher := rabbitmq.NewPublisher(conn, cfg.RabbitMQ.Config, log)
-	group.Add("outbox", messaging.NewOutboxDispatcher(d.db, publisher, cfg.Outbox, log))
-
-	if !cfg.RabbitMQ.ConsumersEnabled {
-		log.Info("consumers disabled on this host (rabbitmq.consumers_enabled=false)")
-		return
-	}
-	inbox := messaging.NewInbox(d.db)
-	subscriptions := []messaging.Subscription{
-		messaging.Subscribe(order.EventCreated, queueName(cfg.Service.Name, order.EventCreated),
-			inbox, consumers.NewOrderCreatedHandler(d.orders, log)),
-	}
-	group.Add("consumers", rabbitmq.NewConsumerHost(conn, cfg.RabbitMQ.Config, publisher, log, subscriptions...))
-}
-
 // registerTasks wires the task runner with the reference tasks. tasks.max_workers=0 keeps the
 // registrations but the runner exits at once.
 func (d *dependencies) registerTasks(cfg *config.Config, group *lifecycle.Group, log *slog.Logger) {
 	store := taskqueue.NewStore(d.db)
 	runner := taskqueue.NewRunner(store, cfg.Tasks, log)
+	// The interval here is only the fallback: tasks.recurring.pending-orders-reaper in the
+	// configuration overrides it (default.yaml sets it), so change it there, not here.
 	must(runner.Recurring("pending-orders-reaper", time.Minute,
 		tasks.NewPendingOrdersReaper(d.orders, cfg.Orders.PendingTimeout, log)))
 	must(runner.Cron("heartbeat", "0 */5 * * * *", tasks.NewHeartbeat(log)))
-	group.Add("tasks", runner)
-}
-
-// queueName is "{service}.{event}": the same in both host modes, so API pods and worker pods
-// that both consume are competing consumers on one queue, never two copies of the work.
-func queueName(service, event string) string {
-	return service + "." + event
+	group.Add("tasks", runner, lifecycle.WithDrain(cfg.Tasks.DrainTimeout))
 }
 
 // must turns a registration error — a programming mistake caught at startup — into a panic.

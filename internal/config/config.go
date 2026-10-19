@@ -1,6 +1,6 @@
 // Package config is the service's typed configuration: the platform sections from the kit plus
 // the service's own, bound from the embedded YAML defaults, the APP_ENV overlay and the
-// environment (see pkg/conf for the rules), and validated before anything starts.
+// environment (see the kit's conf package for the rules), and validated before anything starts.
 package config
 
 import (
@@ -9,22 +9,24 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"example.com/msvcservice/pkg/auth"
-	"example.com/msvcservice/pkg/cache"
-	"example.com/msvcservice/pkg/conf"
-	"example.com/msvcservice/pkg/httpclient"
-	"example.com/msvcservice/pkg/httpserver"
-	"example.com/msvcservice/pkg/logging"
-	"example.com/msvcservice/pkg/messaging"
-	"example.com/msvcservice/pkg/middleware"
-	"example.com/msvcservice/pkg/postgres"
-	"example.com/msvcservice/pkg/rabbitmq"
-	"example.com/msvcservice/pkg/redisx"
-	"example.com/msvcservice/pkg/taskqueue"
-	"example.com/msvcservice/pkg/telemetry"
+	"github.com/guangliangus/go-msvc-kit/auth"
+	"github.com/guangliangus/go-msvc-kit/cache"
+	"github.com/guangliangus/go-msvc-kit/conf"
+	"github.com/guangliangus/go-msvc-kit/httpclient"
+	"github.com/guangliangus/go-msvc-kit/httpserver"
+	"github.com/guangliangus/go-msvc-kit/kafka"
+	"github.com/guangliangus/go-msvc-kit/logging"
+	"github.com/guangliangus/go-msvc-kit/messaging"
+	"github.com/guangliangus/go-msvc-kit/middleware"
+	"github.com/guangliangus/go-msvc-kit/postgres"
+	"github.com/guangliangus/go-msvc-kit/rabbitmq"
+	"github.com/guangliangus/go-msvc-kit/redisx"
+	"github.com/guangliangus/go-msvc-kit/taskqueue"
+	"github.com/guangliangus/go-msvc-kit/telemetry"
 )
 
 //go:embed default.yaml development.yaml
@@ -47,6 +49,7 @@ type Config struct {
 	Redis          redisx.Config                `koanf:"redis"`
 	Cache          cache.Config                 `koanf:"cache"`
 	RabbitMQ       RabbitMQConfig               `koanf:"rabbitmq"`
+	Kafka          KafkaConfig                  `koanf:"kafka"`
 	Outbox         messaging.OutboxConfig       `koanf:"outbox"`
 	Tasks          taskqueue.Config             `koanf:"tasks"`
 	Auth           auth.Config                  `koanf:"auth"`
@@ -55,6 +58,17 @@ type Config struct {
 
 	// Environment is APP_ENV, not a YAML key.
 	Environment string `koanf:"-"`
+}
+
+// Validate holds the rules that are this service's, not the kit's. The kit no longer demands a
+// signing key of every service (one that serves only cluster-internal routes has no tokens to
+// check); this one serves user-svc's bearer tokens on both planes, so a deployment without the
+// key is refused at load time, before anything is opened, rather than when the validator is built.
+func (c *Config) Validate() error {
+	if strings.TrimSpace(c.Auth.SigningKey) == "" {
+		return errors.New("auth.signing_key is required: this service validates user-svc tokens (AUTH__SIGNING_KEY)")
+	}
+	return nil
 }
 
 // ServiceConfig is bound from "service".
@@ -79,6 +93,45 @@ type HTTPConfig struct {
 type RequiredHeadersConfig struct {
 	Consumer   []string `koanf:"consumer"`
 	BackOffice []string `koanf:"backoffice"`
+}
+
+// KafkaConfig is the kit's Kafka config plus which events live on Kafka and the host-shape switch.
+type KafkaConfig struct {
+	kafka.Config `koanf:",squash"`
+	// Events are the event names that live on Kafka: published to it and consumed from it. Every
+	// other event stays on RabbitMQ. A producer and all of an event's consumers must agree, so an
+	// event moves bus by a platform decision, never by one service's configuration alone.
+	Events []string `koanf:"events"`
+	// ConsumersEnabled runs the Kafka consumers on this host; false on API pods beside a worker
+	// deployment, as for RabbitMQ.
+	ConsumersEnabled bool `koanf:"consumers_enabled"`
+}
+
+// Validate checks the kit's rules and the event list: an event on Kafka while Kafka is off would
+// never be published, and an event name must be a legal topic unless kafka.topics maps it.
+func (c *KafkaConfig) Validate() error {
+	if err := c.Config.Validate(); err != nil {
+		return err
+	}
+	if len(c.Events) > 0 && !c.Enabled {
+		return fmt.Errorf("events %v are routed to Kafka but kafka.enabled is false", c.Events)
+	}
+	seen := map[string]bool{}
+	for _, event := range c.Events {
+		if seen[event] {
+			return fmt.Errorf("event %q is listed twice", event)
+		}
+		seen[event] = true
+		if err := kafka.ValidateTopicName(c.TopicFor(event)); err != nil {
+			return fmt.Errorf("event %q: %w", event, err)
+		}
+	}
+	return nil
+}
+
+// OnKafka reports whether an event lives on Kafka (false for every event while Kafka is off).
+func (c *KafkaConfig) OnKafka(event string) bool {
+	return c.Enabled && slices.Contains(c.Events, event)
 }
 
 // RabbitMQConfig is the kit's broker config plus the host-shape switch.

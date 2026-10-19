@@ -9,3 +9,7 @@ description: >-
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+# The preStop hook is `sleep` (PodLifecycleSleepAction, on by default since 1.30): the distroless
+# runtime image has no shell and no sleep binary to exec instead. "-0" lets pre-release and
+# vendor-suffixed server versions (1.30.0-eks-1, 1.31.2-gke.100) satisfy the constraint.
+kubeVersion: ">=1.30.0-0"

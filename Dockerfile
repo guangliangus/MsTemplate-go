@@ -1,5 +1,5 @@
-# Build context = the repository root:
-#   docker build -t msvcservice:local .
+# Build context = the repository root (the kit credential is explained at `go mod download`):
+#   make docker
 # One image, two shapes: `serve` (default) and `worker`, selected by the container command.
 # The database schema is NOT baked or migrated here — db/*.sql is applied by hand (db/README.md).
 #
@@ -8,11 +8,19 @@
 # proposes digest updates as reviewable PRs.
 FROM golang:1.27-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
 ARG VERSION=dev
+# The platform kit is a private module on GitHub: the go command fetches it with git, bypassing
+# the public proxy and checksum database. The Alpine variant ships without git.
+ENV GOPRIVATE=github.com/guangliangus/*
+RUN apk add --no-cache git
 WORKDIR /src
 
-# Dependencies first, so a code change does not invalidate the module download layer.
+# Dependencies first, so a code change does not invalidate the module download layer. The kit's
+# credential arrives as a BuildKit secret — one netrc line, mounted for this step only and never
+# in a layer or the image history (a build arg would be in both):
+#   docker build --secret id=netrc,env=KIT_NETRC .   with KIT_NETRC="machine github.com login x-access-token password <token>"
+# `make docker` sets it from `gh auth token`.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=secret,id=netrc,target=/root/.netrc go mod download
 
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \

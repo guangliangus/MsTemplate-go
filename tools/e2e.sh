@@ -4,30 +4,38 @@
 #   → outbox → RabbitMQ → consumer confirms → 400 / 422 error contract → idempotent replay
 #   → rate limit (429) → circuit breaker (502 via the WireMock FAULT SKU) → RabbitMQ restart,
 #   automatic reconnect, one more order.
-# Usage: tools/e2e.sh [--keep] [--no-app]
-#   --keep    leaves the stack running afterwards
+# Usage: tools/e2e.sh [--keep] [--no-app [--up]]
+#   --keep    leaves the stack running afterwards (only matters for a stack this run started)
 #   --no-app  does not build/start the containerised service: the API is expected to be running
 #             already (e.g. `make run` on the host: API=http://localhost:8080 and
-#             ADMIN=http://localhost:8081), only the
-#             infrastructure comes from compose
+#             ADMIN=http://localhost:8081) on top of the compose infrastructure `make up` started.
+#             The running stack is NOT touched (no `up`, so PostgreSQL/Redis are never recreated
+#             under the host process) and is not torn down afterwards.
+#   --up      with --no-app: start whatever part of the infrastructure is missing
+#             (`up -d --no-recreate`, running containers stay as they are); torn down at the end
+#             unless --keep.
+# Host ports: the compose defaults (5432/6379/...) unless POSTGRES_HOST_PORT etc. are set in the
+# environment — the same variables `make up` honours, so this script and the host app agree.
 set -euo pipefail
-KEEP=false; NO_APP=false
+KEEP=false; NO_APP=false; UP=false
 for arg in "$@"; do
   case "$arg" in
     --keep) KEEP=true ;;
     --no-app) NO_APP=true ;;
+    --up) UP=true ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+if $UP && ! $NO_APP; then echo "--up only makes sense with --no-app" >&2; exit 2; fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 API=${API:-http://localhost:${API_HOST_PORT:-8080}}
 ADMIN=${ADMIN:-http://localhost:${ADMIN_HOST_PORT:-8081}}
 MINT="$ROOT/tools/mint-dev-token.sh"
-export POSTGRES_HOST_PORT=${POSTGRES_HOST_PORT:-15432}
-export REDIS_HOST_PORT=${REDIS_HOST_PORT:-16379}
 COMPOSE="docker compose --profile app"
 if $NO_APP; then COMPOSE="docker compose"; fi
+# What this run brought up is what it tears down: never the stack the host app is sitting on.
+STARTED=false
 
 log() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31mFAIL: %s\033[0m\n' "$*"; $COMPOSE logs --tail 40 api || true; exit 1; }
@@ -45,14 +53,35 @@ wait_http() { # url, timeout_s
 
 # No --wait: it reports the one-shot schema service's normal exit as a failure. Readiness is
 # polled below instead, which is the check that matters.
-if $NO_APP; then
-  log "compose up (infrastructure only; the API is expected at $API)"
-  $COMPOSE up -d
+if $NO_APP && $UP; then
+  log "compose up --no-recreate (missing infrastructure only; the API is expected at $API)"
+  $COMPOSE up -d --no-recreate
+  STARTED=true
+elif $NO_APP; then
+  log "using the running compose infrastructure as it is (the API is expected at $API)"
 else
   log "compose up (--build so the run always tests the CURRENT code)"
+  # The image build fetches the private platform kit; its credential is one netrc line (compose
+  # passes it as a build secret). From the environment in CI, from the GitHub CLI locally.
+  KIT_NETRC=${KIT_NETRC:-"machine github.com login x-access-token password $(gh auth token)"}
+  export KIT_NETRC
   $COMPOSE up -d --build --quiet-pull
+  STARTED=true
 fi
-docker compose wait schema >/dev/null || fail "db/*.sql could not be applied (docker compose logs schema)"
+# The one-shot schema service must have exited 0. `docker compose wait` only sees a container that
+# is still running, so it is used while one is; a schema run that finished before this script
+# started (make up earlier, the --no-app case) is read back from its recorded exit code instead.
+schema_applied() {
+  local state
+  state=$(docker compose ps -a --format '{{.State}} {{.ExitCode}}' schema 2>/dev/null)
+  case "$state" in
+    running*) docker compose wait schema >/dev/null ;;
+    "exited 0") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+schema_applied \
+  || fail "db/*.sql not applied: no running stack (make up, or --no-app --up) or the schema service failed (docker compose logs schema)"
 
 log "waiting for API readiness (db/*.sql applied by the schema service first)"
 wait_http "$ADMIN/health/ready" 240 || fail "API never became ready"
@@ -143,6 +172,6 @@ done
 echo "reconnect ✓"
 
 log "E2E PASSED"
-if ! $KEEP; then
+if $STARTED && ! $KEEP; then
   $COMPOSE down -v >/dev/null
 fi

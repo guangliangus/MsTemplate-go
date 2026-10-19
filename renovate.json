@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Keeps every pin moving through reviewable PRs: Go modules (service and tools/go.mod), base image digests, the pipeline's tool versions. A release must be two weeks old before it is proposed.",
+  "description": "Keeps every pin moving through reviewable PRs: Go modules (service and tools/go.mod), base image digests, the pipeline's and the Makefile's tool versions, the kind smoke test's images. A release must be two weeks old before it is proposed.",
   "extends": [
     "config:recommended",
     "docker:pinDigests"
@@ -9,15 +9,41 @@
   "postUpdateOptions": [
     "gomodTidy"
   ],
+  "kubernetes": {
+    "description": "Plain manifests are not auto-detected: the kind smoke test's throwaway dependencies (postgres/redis/rabbitmq/wiremock images)",
+    "managerFilePatterns": [
+      "/^deploy/kind/.+\\.ya?ml$/"
+    ]
+  },
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Tool versions in azure-pipelines.yml marked with a '# renovate:' comment",
+      "description": "Versions in azure-pipelines.yml marked with a '# renovate:' comment on the line above (optionally 'versioning=...'): tool pins, the DDL gate's PostgreSQL tag, and the Go toolchain (goVersion), which the 'Go toolchain' rule below bumps together with the Dockerfile's golang tag",
       "managerFilePatterns": [
         "/^azure-pipelines\\.yml$/"
       ],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+: (?<currentValue>\\S+)"
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\s+\\w+: \"?(?<currentValue>[^\"\\s]+)\"?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "The Makefile's golangci-lint pin (GOLANGCI_LINT_VERSION := vX.Y.Z), the same depName as the pipeline's so both move in one PR",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+ :?= (?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Image tags in shell scripts (CURL_VERSION=8.10.1 in deploy/kind/kind-smoke.sh) marked with a '# renovate:' comment",
+      "managerFilePatterns": [
+        "/^deploy/kind/kind-smoke\\.sh$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+=(?<currentValue>\\S+)"
       ]
     }
   ],
@@ -28,6 +54,22 @@
         "helm/helm"
       ],
       "allowedVersions": "<4"
+    },
+    {
+      "description": "The Go toolchain is pinned twice — the Dockerfile's golang:<minor>-alpine tag and azure-pipelines.yml goVersion — so one PR bumps both (digest-only updates of the image stay separate)",
+      "matchDatasources": [
+        "docker",
+        "golang-version"
+      ],
+      "matchPackageNames": [
+        "golang",
+        "go"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "major"
+      ],
+      "groupName": "Go toolchain"
     }
   ]
 }

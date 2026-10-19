@@ -4,6 +4,15 @@ config:
   APP_ENV: development
   TELEMETRY__TRACE_SAMPLE_RATIO: "1.0"
 
+# The pipeline never passes secret values, so the chart creates no Secret here. BEFORE the first
+# `helm upgrade --install` the operator creates one in the namespace, named <release>-secrets
+# (msvcservice-secrets for the pipeline's release name) with POSTGRES__DSN, RABBITMQ__URL and
+# AUTH__SIGNING_KEY — or names an existing one in secret.existingName. Repeated from the base on
+# purpose, so the file an environment is deployed with says where its credentials come from.
+secret:
+  create: false
+  existingName: ""
+
 api:
   replicas: 1
   hpa: { enabled: false }

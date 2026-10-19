@@ -8,7 +8,9 @@ config:
   REDIS__ADDR: redis:6379
   TELEMETRY__OTLP_ENDPOINT: ""
   SERVICE_CLIENTS__INVENTORY__BASE_URL: http://wiremock:8080/
+# A throwaway cluster: the chart renders the Secret itself (the overlays leave that to the operator).
 secret:
+  create: true
   values:
     POSTGRES__DSN: postgres://msvc:msvc@postgres:5432/msvcservice?sslmode=disable
     RABBITMQ__URL: amqp://guest:guest@rabbitmq:5672/

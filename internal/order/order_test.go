@@ -5,12 +5,31 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"example.com/msvcservice/pkg/apperror"
+	"github.com/guangliangus/go-msvc-kit/apperror"
+	"github.com/guangliangus/go-msvc-kit/messaging"
 )
 
 func price(s string) decimal.Decimal {
 	d, _ := decimal.NewFromString(s)
 	return d
+}
+
+func manyItems(n int) []Item {
+	items := make([]Item, n)
+	for i := range items {
+		items[i] = Item{SKU: "A", Quantity: 1, UnitPrice: price("1")}
+	}
+	return items
+}
+
+// MaxItems is the order's rule, enforced here for every caller, not a limit of the HTTP shape.
+func TestNewEnforcesMaxItemsInclusive(t *testing.T) {
+	if _, err := New("1", manyItems(MaxItems)); err != nil {
+		t.Fatalf("exactly MaxItems lines are allowed: %v", err)
+	}
+	if e, _ := apperror.As(CheckLines("1", make([]Line, MaxItems+1))); e == nil || e.Code != CodeItemInvalid {
+		t.Fatal("one more line is refused before anything is priced")
+	}
 }
 
 func TestNewComputesTotalAndStartsPending(t *testing.T) {
@@ -36,6 +55,7 @@ func TestNewRefusesInvalidOrders(t *testing.T) {
 		"no items":    {"1", nil, CodeItemsRequired},
 		"no sku":      {"1", []Item{{SKU: " ", Quantity: 1}}, CodeItemInvalid},
 		"zero qty":    {"1", []Item{{SKU: "A", Quantity: 0}}, CodeItemInvalid},
+		"too many":    {"1", manyItems(MaxItems + 1), CodeItemInvalid},
 		"negative":    {"1", []Item{{SKU: "A", Quantity: 1, UnitPrice: price("-1")}}, CodeItemInvalid},
 		"too large":   {"1", []Item{{SKU: "A", Quantity: 1000, UnitPrice: price("100000")}}, CodeTotalTooLarge},
 	}
@@ -64,5 +84,14 @@ func TestTransitions(t *testing.T) {
 	fresh, _ := New("1", []Item{{SKU: "A", Quantity: 1, UnitPrice: price("1")}})
 	if err := fresh.Cancel(); err != nil || fresh.Status != StatusCancelled {
 		t.Fatal(err)
+	}
+}
+
+// The order id is the event's partition key: on Kafka an order's events stay on one partition, in
+// publish order.
+func TestCreatedEventIsKeyedByTheOrder(t *testing.T) {
+	var event messaging.Keyed = CreatedEvent{OrderID: 42}
+	if event.PartitionKey() != "42" {
+		t.Fatalf("key = %q", event.PartitionKey())
 	}
 }

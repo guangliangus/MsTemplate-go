@@ -15,14 +15,17 @@
 # 聚合：队列深度、积压时长、outbox 积压这几个 gauge 每个副本上报的都是同一个全局值，用 max，
 #       不要 sum。选择器用 job（ServiceMonitor 打的 target label；compose 里是 msvcservice-api /
 #       msvcservice-worker）。
+# 范围：每条 expr 都带 {job=~"msvcservice-.*"}。集群的 Prometheus 抓所有服务，没有这个选择器，
+#       导入的规则会对别的服务（乃至 up == 0 对整个集群）报警。job 是 Service 名（<release>-api /
+#       <release>-worker），release 名就是服务名；tools/new-service.sh 改名时一并替换。
 groups:
   - name: msvcservice-http
     rules:
       - alert: HighHttpErrorRate
         expr: |
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{job=~"msvcservice-.*", http_response_status_code=~"5.."}[5m]))
             /
-          sum by (job) (rate(http_server_request_duration_seconds_count[5m])) > 0.05
+          sum by (job) (rate(http_server_request_duration_seconds_count{job=~"msvcservice-.*"}[5m])) > 0.05
         for: 5m
         labels: { service: msvcservice, alertgroup: http, severity: critical }
         annotations:
@@ -37,7 +40,7 @@ groups:
       - alert: HighHttpLatencyP95
         expr: |
           histogram_quantile(0.95,
-            sum by (job, le) (rate(http_server_request_duration_seconds_bucket[5m]))) > 0.5
+            sum by (job, le) (rate(http_server_request_duration_seconds_bucket{job=~"msvcservice-.*"}[5m]))) > 0.5
         for: 10m
         labels: { service: msvcservice, alertgroup: http, severity: warning }
         annotations:
@@ -47,7 +50,7 @@ groups:
             排队看 rate(pgxpool_empty_acquire_total[5m])。再看下游：按路由的 p95 与熔断器面板。
 
       - alert: UpstreamUnavailable
-        expr: sum by (job, http_route) (rate(msvc_http_problems_total{error_code="UPSTREAM_SERVICE_UNAVAILABLE"}[5m])) > 0.1
+        expr: sum by (job, http_route) (rate(msvc_http_problems_total{job=~"msvcservice-.*", error_code="UPSTREAM_SERVICE_UNAVAILABLE"}[5m])) > 0.1
         for: 5m
         labels: { service: msvcservice, alertgroup: http, severity: warning }
         annotations:
@@ -59,7 +62,7 @@ groups:
             常见成因：下游发布中、下游超时阈值低于它的真实延迟、base_url 配错（那是 NOT_CONFIGURED，另一种码）。
 
       - alert: IdempotencyStoreUnavailable
-        expr: increase(msvc_http_problems_total{error_code="IDEMPOTENCY_STORE_UNAVAILABLE"}[5m]) > 0
+        expr: increase(msvc_http_problems_total{job=~"msvcservice-.*", error_code="IDEMPOTENCY_STORE_UNAVAILABLE"}[5m]) > 0
         labels: { service: msvcservice, alertgroup: http, severity: critical }
         annotations:
           summary: "{{ $labels.job }}: 幂等存储不可达，带 Idempotency-Key 的写请求被拒绝"
@@ -70,7 +73,7 @@ groups:
   - name: msvcservice-messaging
     rules:
       - alert: OutboxBacklogGrowing
-        expr: max by (job) (msvc_messaging_outbox_pending) > 100
+        expr: max by (job) (msvc_messaging_outbox_pending{job=~"msvcservice-.*"}) > 100
         for: 10m
         labels: { service: msvcservice, alertgroup: messaging, severity: warning }
         annotations:
@@ -81,7 +84,7 @@ groups:
             常见成因：RabbitMQ 不可达（投递器自动重连，积压会自己消化）、所有 pod 都是 rabbitmq.enabled=false。
 
       - alert: OutboxOldestPendingAge
-        expr: max by (job) (msvc_messaging_outbox_oldest_pending_age_seconds) > 300
+        expr: max by (job) (msvc_messaging_outbox_oldest_pending_age_seconds{job=~"msvcservice-.*"}) > 300
         for: 5m
         labels: { service: msvcservice, alertgroup: messaging, severity: critical }
         annotations:
@@ -91,7 +94,7 @@ groups:
             FAILED 行（max_attempts 用尽）不在这条里：修好原因后 UPDATE outbox_messages SET status='PENDING', attempts=0 WHERE status='FAILED' 回放。
 
       - alert: MessagesDeadLetteredExhausted
-        expr: increase(msvc_messaging_dead_lettered_total{reason="exhausted"}[15m]) > 0
+        expr: increase(msvc_messaging_dead_lettered_total{job=~"msvcservice-.*", reason="exhausted"}[15m]) > 0
         labels: { service: msvcservice, alertgroup: messaging, severity: critical }
         annotations:
           summary: "{{ $labels.queue }}: 消息走完重试梯队仍失败，进了 DLQ"
@@ -104,7 +107,7 @@ groups:
   - name: msvcservice-tasks
     rules:
       - alert: TaskQueueBacklogGrowing
-        expr: max by (queue) (msvc_tasks_queue_depth) > 100
+        expr: max by (queue) (msvc_tasks_queue_depth{job=~"msvcservice-.*"}) > 100
         for: 10m
         labels: { service: msvcservice, alertgroup: tasks, severity: warning }
         annotations:
@@ -114,7 +117,7 @@ groups:
             常见成因：没有 pod 在跑这个队列（TASKS__MAX_WORKERS=0 配到了所有 pod）、worker 数跟不上产量。
 
       - alert: TaskOldestPendingAge
-        expr: max by (queue) (msvc_tasks_oldest_pending_age_seconds) > 600
+        expr: max by (queue) (msvc_tasks_oldest_pending_age_seconds{job=~"msvcservice-.*"}) > 600
         for: 5m
         labels: { service: msvcservice, alertgroup: tasks, severity: warning }
         annotations:
@@ -124,7 +127,7 @@ groups:
             日志 |= "task failed"），或 worker 反复在停机/崩溃时丢下任务被 fixer 回收（increase(msvc_tasks_reclaimed_total[15m])）。
 
       - alert: TasksExhausted
-        expr: increase(msvc_tasks_dead_total{reason="exhausted"}[15m]) > 0
+        expr: increase(msvc_tasks_dead_total{job=~"msvcservice-.*", reason="exhausted"}[15m]) > 0
         labels: { service: msvcservice, alertgroup: tasks, severity: warning }
         annotations:
           summary: "{{ $labels.queue }}: 任务用尽 attempts 预算后被放弃"
@@ -133,7 +136,7 @@ groups:
             放弃的任务已从 task_queues 删除，需要重放时从业务表的状态重新入队。
 
       - alert: TasksFailing
-        expr: sum by (queue) (increase(msvc_tasks_failed_total[30m])) > 3
+        expr: sum by (queue) (increase(msvc_tasks_failed_total{job=~"msvcservice-.*"}[30m])) > 3
         labels: { service: msvcservice, alertgroup: tasks, severity: warning }
         annotations:
           summary: "{{ $labels.queue }}: 任务 handler 30 分钟内失败超过 3 次"
@@ -145,7 +148,7 @@ groups:
   - name: msvcservice-database
     rules:
       - alert: DbPoolSaturated
-        expr: sum by (job) (rate(pgxpool_empty_acquire_total[5m])) > 1
+        expr: sum by (job) (rate(pgxpool_empty_acquire_total{job=~"msvcservice-.*"}[5m])) > 1
         for: 5m
         labels: { service: msvcservice, alertgroup: database, severity: warning }
         annotations:
@@ -157,7 +160,7 @@ groups:
             注意：慢 SQL 日志里的 elapsed 不含排队时间，排队只在这条指标上可见。
 
       - alert: DbSlowQueries
-        expr: sum by (job) (rate(msvc_db_slow_queries_total[5m])) > 0.5
+        expr: sum by (job) (rate(msvc_db_slow_queries_total{job=~"msvcservice-.*"}[5m])) > 0.5
         for: 10m
         labels: { service: msvcservice, alertgroup: database, severity: warning }
         annotations:
@@ -169,7 +172,7 @@ groups:
   - name: msvcservice-infra
     rules:
       - alert: DependencyUnavailable
-        expr: min by (job, check) (msvc_health_check_up) == 0
+        expr: min by (job, check) (msvc_health_check_up{job=~"msvcservice-.*"}) == 0
         for: 2m
         labels: { service: msvcservice, alertgroup: infra, severity: critical }
         annotations:
@@ -181,7 +184,7 @@ groups:
             详情：admin 端口的 /health/ready 报告里每项的 description。
 
       - alert: ScrapeTargetDown
-        expr: up == 0
+        expr: up{job=~"msvcservice-.*"} == 0
         for: 2m
         labels: { service: msvcservice, alertgroup: infra, severity: critical }
         annotations:

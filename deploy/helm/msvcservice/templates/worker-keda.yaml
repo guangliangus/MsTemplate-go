@@ -1,6 +1,26 @@
 {{- if and .Values.worker.enabled .Values.worker.keda.enabled }}
+{{- $keda := .Values.worker.keda }}
+{{- $kedaSecret := $keda.existingSecretName | default (printf "%s-keda" (include "msvc.fullname" .)) }}
+{{- if eq $keda.trigger "rabbitmq" }}
+{{- if and (not $keda.amqpConnection) (not $keda.existingSecretName) }}
+{{- fail "worker.keda.enabled=true needs the AMQP connection string KEDA polls the queue with: set worker.keda.amqpConnection (rendered into the <release>-keda Secret) or worker.keda.existingSecretName (a Secret holding it under worker.keda.amqpConnectionSecretKey)." }}
+{{- end }}
+{{- if not $keda.existingSecretName }}
+# KEDA's own credential, in its own Secret: the app Secret is envFrom'd into every container and
+# must not carry a broker login the application never uses.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $kedaSecret }}
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ $keda.amqpConnectionSecretKey }}: {{ $keda.amqpConnection | quote }}
+---
+{{- end }}
 # Scales the worker on queue depth. Requires KEDA; the AMQP connection string comes from the
-# release Secret under .Values.worker.keda.amqpConnectionSecretKey.
+# Secret above (or worker.keda.existingSecretName) under worker.keda.amqpConnectionSecretKey.
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:
@@ -10,9 +30,50 @@ metadata:
 spec:
   secretTargetRef:
     - parameter: host
-      name: {{ include "msvc.fullname" . }}-secrets
-      key: {{ .Values.worker.keda.amqpConnectionSecretKey }}
+      name: {{ $kedaSecret }}
+      key: {{ $keda.amqpConnectionSecretKey }}
 ---
+{{- else if eq $keda.trigger "kafka" }}
+{{- $kafka := $keda.kafka }}
+{{- if not $kafka.bootstrapServers }}
+{{- fail "worker.keda.trigger=kafka needs worker.keda.kafka.bootstrapServers (host:port,host:port of the service's KAFKA__BROKERS)." }}
+{{- end }}
+{{- $authenticated := or (ne $kafka.sasl "none") (eq $kafka.tls "enable") }}
+{{- if and $authenticated (not $keda.existingSecretName) }}
+# KEDA's own Kafka login, in its own Secret: never envFrom'd into the application's containers.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $kedaSecret }}
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  sasl: {{ $kafka.sasl | quote }}
+  tls: {{ $kafka.tls | quote }}
+  username: {{ $kafka.username | quote }}
+  password: {{ $kafka.password | quote }}
+---
+{{- end }}
+{{- if $authenticated }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "msvc.fullname" . }}-kafka
+  labels:
+    {{- include "msvc.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    {{- range $param := list "sasl" "tls" "username" "password" }}
+    - parameter: {{ $param }}
+      name: {{ $kedaSecret }}
+      key: {{ $param }}
+    {{- end }}
+---
+{{- end }}
+{{- else }}
+{{- fail (printf "worker.keda.trigger must be rabbitmq or kafka, got %q" $keda.trigger) }}
+{{- end }}
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -22,15 +83,31 @@ metadata:
 spec:
   scaleTargetRef:
     name: {{ include "msvc.fullname" . }}-worker
-  minReplicaCount: {{ .Values.worker.keda.minReplicas }}
-  maxReplicaCount: {{ .Values.worker.keda.maxReplicas }}
+  minReplicaCount: {{ $keda.minReplicas }}
+  maxReplicaCount: {{ $keda.maxReplicas }}
   triggers:
+    {{- if eq $keda.trigger "rabbitmq" }}
     - type: rabbitmq
       metadata:
         protocol: amqp
-        queueName: {{ .Values.worker.keda.queueName | quote }}
+        queueName: {{ $keda.queueName | quote }}
         mode: QueueLength
-        value: {{ .Values.worker.keda.queueLength | quote }}
+        value: {{ $keda.queueLength | quote }}
       authenticationRef:
         name: {{ include "msvc.fullname" . }}-rabbitmq
+    {{- else }}
+    {{- $kafka := $keda.kafka }}
+    # Scales on the consumer group's lag. The group and topic follow the service's naming:
+    # "{service}.{event}" and the event name (or its kafka.topics override).
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ $kafka.bootstrapServers | quote }}
+        consumerGroup: {{ $kafka.consumerGroup | quote }}
+        topic: {{ $kafka.topic | quote }}
+        lagThreshold: {{ $kafka.lagThreshold | quote }}
+      {{- if or (ne $kafka.sasl "none") (eq $kafka.tls "enable") }}
+      authenticationRef:
+        name: {{ include "msvc.fullname" . }}-kafka
+      {{- end }}
+    {{- end }}
 {{- end }}
