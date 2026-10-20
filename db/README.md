@@ -15,6 +15,8 @@ psql "postgresql://msvc:msvc@localhost:5432/msvcservice" -v ON_ERROR_STOP=1 -f d
 | 脚本 | 属于 | 不用该能力时 |
 |---|---|---|
 | `0001_init.sql` | 示例业务（orders / order_items） | 换成你的业务表 |
+| `0002_orders_version.sql` | 示例业务：`orders.version` 乐观并发列（GORM 的 `optimisticlock` 插件用它，取代 `xmin`） | 随示例一起删 |
+| `0003_orders_request_id.sql` | 示例业务：下单的业务幂等，`orders.request_id` 与 `(customer_id, request_id)` 部分唯一索引 | 随示例一起删；你的写要幂等时照它的形状加 |
 | `kit_0001_messaging.sql` | kit：`rabbitmq.enabled` / `kafka.enabled` 的 outbox / inbox（两个 broker 共用） | 可不执行 |
 | `kit_0002_tasks.sql` | kit：`tasks.max_workers > 0` 的任务队列 | 可不执行 |
 
@@ -42,7 +44,7 @@ psql "postgresql://msvc:msvc@localhost:5432/msvcservice" -v ON_ERROR_STOP=1 -f d
 1. **已执行过的脚本永不修改**——任何变更都追加新编号脚本（`0002_add_xxx.sql`、`0003_...`；`kit_` 系列归 kit 管）。
 2. 脚本必须**幂等**（`IF NOT EXISTS` 等），可安全重复执行；流水线门禁会把每个脚本**执行两遍**。
 3. **先执行 DDL，再发布代码**。滚动发布期间新旧代码并存，DDL 必须向后兼容：只加列/加表/加索引；改名和删除拆成两个版本（先让所有代码停用，再删）。
-4. 表结构与仓储层的 SQL（`internal/postgres`）必须一致，不一致会在集成测试（Testcontainers 用本目录建库）和运行时报错。
+4. 表结构与仓储的 GORM 模型（`internal/postgres`）必须一致：模型是这里 DDL 的映射，应用永不 AutoMigrate；不一致会在集成测试（Testcontainers 用本目录建库）和运行时报错，没有编译期检查（known-open #8）。改表先改这里，再改模型。
 5. 每个环境执行到哪个脚本需有记录（工单/文档均可；也可在库里建一张执行记录表）。
 
 ## 守卫

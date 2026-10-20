@@ -4,5 +4,6 @@
   "ORDER_ITEM_UNAVAILABLE": "An item is out of stock.",
   "ORDER_NOT_PENDING": "The order is no longer pending.",
   "ORDER_NOT_CANCELLABLE": "This order cannot be cancelled.",
-  "ORDER_TOTAL_TOO_LARGE": "The order total is too large; split it into smaller orders."
+  "ORDER_TOTAL_TOO_LARGE": "The order total is too large; split it into smaller orders.",
+  "ORDER_REQUEST_ID_REUSED": "This request key was already used for a different order."
 }

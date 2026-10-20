@@ -18,17 +18,17 @@ import (
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func TestPendingOrdersReaperCancelsStalePendingOrders(t *testing.T) {
-	svc, repo, _ := ordertest.NewService(ordertest.Inventory{UnitPrice: decimal.NewFromInt(1)})
+	svc, repo, _ := ordertest.NewService(t, ordertest.Inventory{UnitPrice: decimal.NewFromInt(1)})
 	ctx := context.Background()
 	ids := make([]int, 0, 2)
 	for _, sku := range []string{"A", "B"} {
-		o, err := svc.Create(ctx, "c1", []order.Line{{SKU: sku, Quantity: 1}})
+		o, _, err := svc.Create(ctx, "c1", "", []order.Line{{SKU: sku, Quantity: 1}})
 		if err != nil {
 			t.Fatal(err)
 		}
 		ids = append(ids, o.ID)
 	}
-	confirmed, _ := svc.Create(ctx, "c1", []order.Line{{SKU: "C", Quantity: 1}})
+	confirmed, _, _ := svc.Create(ctx, "c1", "", []order.Line{{SKU: "C", Quantity: 1}})
 	if err := svc.Confirm(ctx, confirmed.ID); err != nil {
 		t.Fatal(err)
 	}

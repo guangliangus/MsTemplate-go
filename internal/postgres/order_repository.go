@@ -1,6 +1,9 @@
-// Package postgres holds the service's own repositories: raw SQL over the kit's pool, with the
-// transaction taken from the context, audit columns written explicitly from the context's actor,
-// and xmin as the optimistic concurrency token.
+// Package postgres holds the service's own repositories, written with GORM over the kit's pool.
+// Every call goes through Gorm.On(ctx), so it joins the transaction the context carries and the
+// business rows commit together with the kit's outbox, inbox and task rows. The models are
+// mappings of the hand-written DDL in db/*.sql (never migrated from here); audit columns come from
+// the context's actor in the models' hooks, and orders.version is the optimistic concurrency
+// token, kept by GORM's optimisticlock plugin.
 package postgres
 
 import (
@@ -9,277 +12,255 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"gorm.io/plugin/optimisticlock"
 
 	"example.com/msvcservice/internal/order"
 	"github.com/guangliangus/go-msvc-kit/actor"
 	"github.com/guangliangus/go-msvc-kit/apperror"
 	"github.com/guangliangus/go-msvc-kit/paging"
-	kitpg "github.com/guangliangus/go-msvc-kit/postgres"
 )
 
-// OrderRepository implements order.Repository.
-type OrderRepository struct {
-	db *kitpg.DB
+// requestIDIndex is the unique index that makes a create idempotent (db/0003_orders_request_id.sql).
+const requestIDIndex = "ix_orders_customer_id_request_id"
+
+// orderModel maps the orders table (db/0001_init.sql, 0002_orders_version.sql, 0003_orders_request_id.sql).
+type orderModel struct {
+	ID          int `gorm:"primaryKey"`
+	CustomerID  string
+	Status      string
+	TotalAmount decimal.Decimal
+	CreatedAt   time.Time
+	CreatedBy   string
+	UpdatedAt   time.Time
+	UpdatedBy   string
+	RequestID   string
+	// Version is bumped by every update made through GORM's model API (the plugin adds
+	// "SET version = version + 1" and "WHERE version = <loaded>"). Raw SQL bypasses the plugin and
+	// must bump it by hand.
+	Version optimisticlock.Version
+	Items   []orderItemModel `gorm:"foreignKey:OrderID"`
 }
 
-// NewOrderRepository builds the repository.
-func NewOrderRepository(db *kitpg.DB) *OrderRepository {
-	return &OrderRepository{db: db}
-}
+func (orderModel) TableName() string { return "orders" }
 
-type orderRow struct {
-	ID          int             `db:"id"`
-	CustomerID  string          `db:"customer_id"`
-	Status      string          `db:"status"`
-	TotalAmount decimal.Decimal `db:"total_amount"`
-	CreatedAt   time.Time       `db:"created_at"`
-	CreatedBy   string          `db:"created_by"`
-	UpdatedAt   time.Time       `db:"updated_at"`
-	UpdatedBy   string          `db:"updated_by"`
-	Version     uint32          `db:"xmin"`
-}
-
-type itemRow struct {
-	ID        int             `db:"id"`
-	OrderID   int             `db:"order_id"`
-	SKU       string          `db:"sku"`
-	Quantity  int             `db:"quantity"`
-	UnitPrice decimal.Decimal `db:"unit_price"`
-}
-
-const orderColumns = `id, customer_id, status, total_amount, created_at, created_by, updated_at, updated_by, xmin`
-
-// Insert writes the order and its items; the context's actor becomes created_by / updated_by.
-func (r *OrderRepository) Insert(ctx context.Context, o *order.Order) error {
-	by := actor.FromContext(ctx)
-	q := r.db.Q(ctx)
-	row := q.QueryRow(ctx, `
-		INSERT INTO orders (customer_id, status, total_amount, created_at, created_by, updated_at, updated_by)
-		VALUES ($1, $2, $3, now(), $4, now(), $4)
-		RETURNING id, created_at, updated_at, xmin`,
-		o.CustomerID, string(o.Status), o.TotalAmount, by)
-	if err := row.Scan(&o.ID, &o.CreatedAt, &o.UpdatedAt, &o.Version); err != nil {
-		return fmt.Errorf("orders: insert: %w", err)
-	}
-	o.CreatedBy, o.UpdatedBy = by, by
-
-	n := len(o.Items)
-	skus, quantities, prices := make([]string, n), make([]int32, n), make([]decimal.Decimal, n)
-	for i, it := range o.Items {
-		skus[i], prices[i] = it.SKU, it.UnitPrice
-		quantities[i] = int32(it.Quantity) //nolint:gosec // bounded by the domain's quantity check
-	}
-	rows, err := q.Query(ctx, `
-		INSERT INTO order_items (order_id, sku, quantity, unit_price)
-		SELECT $1, c.sku, c.quantity, CAST(c.unit_price AS numeric)
-		FROM   unnest(CAST($2 AS text[]), CAST($3 AS integer[]), CAST($4 AS text[])) AS c(sku, quantity, unit_price)
-		RETURNING id`, o.ID, skus, quantities, decimalsAsText(prices))
-	if err != nil {
-		return fmt.Errorf("orders: insert items: %w", err)
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int])
-	if err != nil {
-		return fmt.Errorf("orders: read item ids: %w", err)
-	}
-	for i := range o.Items {
-		o.Items[i].ID = ids[i]
-	}
+// BeforeCreate stamps the audit columns with the context's actor.
+func (m *orderModel) BeforeCreate(tx *gorm.DB) error {
+	by := actor.FromContext(tx.Statement.Context)
+	m.CreatedBy, m.UpdatedBy = by, by
 	return nil
 }
 
-func decimalsAsText(values []decimal.Decimal) []string {
-	out := make([]string, len(values))
-	for i, v := range values {
-		out[i] = v.String()
-	}
-	return out
+// BeforeUpdate stamps updated_by on every model update, map updates included.
+func (m *orderModel) BeforeUpdate(tx *gorm.DB) error {
+	tx.Statement.SetColumn("UpdatedBy", actor.FromContext(tx.Statement.Context))
+	return nil
 }
 
-// Get loads one order with its items; a missing or foreign order is 404.
-func (r *OrderRepository) Get(ctx context.Context, id int, customerID string) (*order.Order, error) {
-	q := r.db.Q(ctx)
-	rows, err := q.Query(ctx,
-		`SELECT `+orderColumns+` FROM orders WHERE id = $1 AND ($2 = '' OR customer_id = $2)`, id, customerID)
-	if err != nil {
-		return nil, fmt.Errorf("orders: get %d: %w", id, err)
+// orderItemModel maps the order_items table.
+type orderItemModel struct {
+	ID        int `gorm:"primaryKey"`
+	OrderID   int
+	SKU       string `gorm:"column:sku"`
+	Quantity  int
+	UnitPrice decimal.Decimal
+}
+
+func (orderItemModel) TableName() string { return "order_items" }
+
+// OrderRepository implements order.Repository.
+type OrderRepository struct {
+	gorm *Gorm
+}
+
+// NewOrderRepository builds the repository.
+func NewOrderRepository(g *Gorm) *OrderRepository {
+	return &OrderRepository{gorm: g}
+}
+
+// itemsByID preloads an order's items in id order.
+func itemsByID(db *gorm.DB) *gorm.DB { return db.Order("id") }
+
+// Insert writes the order and its items in one Create (GORM inserts the items after the order and
+// fills their ids); the context's actor becomes created_by / updated_by. A request id the customer
+// already used hits requestIDIndex — after waiting for the transaction that wrote it, when that one
+// is still open — and comes back as order.ErrDuplicateRequest.
+func (r *OrderRepository) Insert(ctx context.Context, o *order.Order) error {
+	m := toModel(o)
+	if err := r.gorm.On(ctx).Create(&m).Error; err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == requestIDIndex {
+			return fmt.Errorf("orders: insert: %w", order.ErrDuplicateRequest)
+		}
+		return fmt.Errorf("orders: insert: %w", err)
 	}
-	head, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[orderRow])
-	if errors.Is(err, pgx.ErrNoRows) {
+	*o = toDomain(m)
+	return nil
+}
+
+// FindByRequestID loads the customer's order created by the request with this id; the lookup is
+// requestIDIndex.
+func (r *OrderRepository) FindByRequestID(ctx context.Context, customerID, requestID string,
+) (*order.Order, bool, error) {
+	var models []orderModel
+	err := r.gorm.On(ctx).Preload("Items", itemsByID).
+		Where("customer_id = ? AND request_id = ?", customerID, requestID).
+		Limit(1).Find(&models).Error
+	if err != nil {
+		return nil, false, fmt.Errorf("orders: find by request id: %w", err)
+	}
+	if len(models) == 0 {
+		return nil, false, nil
+	}
+	o := toDomain(models[0])
+	return &o, true, nil
+}
+
+// Get loads one order with its items; a missing or foreign order is 404. customerID "" reads any
+// customer's order (operators).
+func (r *OrderRepository) Get(ctx context.Context, id int, customerID string) (*order.Order, error) {
+	q := r.gorm.On(ctx).Preload("Items", itemsByID)
+	if customerID != "" {
+		q = q.Where("customer_id = ?", customerID)
+	}
+	var m orderModel
+	err := q.First(&m, id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, apperror.NotFound("Order", id)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("orders: read %d: %w", id, err)
+		return nil, fmt.Errorf("orders: get %d: %w", id, err)
 	}
-	items, err := r.itemsFor(ctx, []int{id})
-	if err != nil {
-		return nil, err
-	}
-	o := toDomain(head)
-	o.Items = items[id]
+	o := toDomain(m)
 	return &o, nil
 }
 
 // List pages one customer's orders newest first; both statements walk ix_orders_customer_id.
-// One query per access path rather than a "$1 = ” OR customer_id = $1" catch-all: a generic plan
-// for the catch-all cannot use the index for either case.
 func (r *OrderRepository) List(ctx context.Context, customerID string, page paging.Request,
 ) ([]order.Order, int64, error) {
-	q := r.db.Q(ctx)
 	var total int64
-	err := q.QueryRow(ctx, `SELECT count(*) FROM orders WHERE customer_id = $1`, customerID).Scan(&total)
+	err := r.gorm.On(ctx).Model(&orderModel{}).Where("customer_id = ?", customerID).Count(&total).Error
 	if err != nil {
 		return nil, 0, fmt.Errorf("orders: count: %w", err)
 	}
-	rows, err := q.Query(ctx, `
-		SELECT `+orderColumns+`
-		FROM   orders
-		WHERE  customer_id = $1
-		ORDER  BY id DESC
-		LIMIT  $2 OFFSET $3`, customerID, page.Limit(), page.Offset())
+	var models []orderModel
+	err = r.gorm.On(ctx).Preload("Items", itemsByID).
+		Where("customer_id = ?", customerID).
+		Order("id DESC").Limit(page.Limit()).Offset(page.Offset()).
+		Find(&models).Error
 	if err != nil {
 		return nil, 0, fmt.Errorf("orders: list: %w", err)
 	}
-	out, err := r.withItems(ctx, rows)
-	if err != nil {
-		return nil, 0, err
-	}
-	return out, total, nil
+	return toDomains(models), total, nil
 }
 
 // ListAll pages every customer's orders newest first by keyset: an index range scan on the
-// primary key that costs the same on any page, and no count.
+// primary key that costs the same on any page, and no count. The bound is only added past the
+// first page, so it reaches the planner as a plain range condition, never "($1 = 0 OR id < $1)".
 func (r *OrderRepository) ListAll(ctx context.Context, page paging.CursorRequest) ([]order.Order, error) {
-	// Two statements, not "($1 = 0 OR id < $1)": the bound must reach the planner as a plain range
-	// condition, or a generic plan walks the index from the newest row down to the cursor on every
-	// page. The cursor is compared as bigint, so any value a client sends — even a forged one past
-	// the int range — is a valid bound rather than an encoding error.
-	q := r.db.Q(ctx)
-	var rows pgx.Rows
-	var err error
+	q := r.gorm.On(ctx).Preload("Items", itemsByID).Order("id DESC").Limit(page.Fetch())
 	if page.After > 0 {
-		rows, err = q.Query(ctx, `
-			SELECT `+orderColumns+`
-			FROM   orders
-			WHERE  id < $2::bigint
-			ORDER  BY id DESC
-			LIMIT  $1`, page.Fetch(), page.After)
-	} else {
-		rows, err = q.Query(ctx, `
-			SELECT `+orderColumns+`
-			FROM   orders
-			ORDER  BY id DESC
-			LIMIT  $1`, page.Fetch())
+		q = q.Where("id < ?", page.After)
 	}
-	if err != nil {
+	var models []orderModel
+	if err := q.Find(&models).Error; err != nil {
 		return nil, fmt.Errorf("orders: list all: %w", err)
 	}
-	return r.withItems(ctx, rows)
+	return toDomains(models), nil
 }
 
-// withItems collects order rows and loads their items in one more query.
-func (r *OrderRepository) withItems(ctx context.Context, rows pgx.Rows) ([]order.Order, error) {
-	heads, err := pgx.CollectRows(rows, pgx.RowToStructByName[orderRow])
-	if err != nil {
-		return nil, fmt.Errorf("orders: read list: %w", err)
-	}
-	ids := make([]int, len(heads))
-	for i, h := range heads {
-		ids[i] = h.ID
-	}
-	items, err := r.itemsFor(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]order.Order, len(heads))
-	for i, h := range heads {
-		out[i] = toDomain(h)
-		out[i].Items = items[h.ID]
-	}
-	return out, nil
-}
-
-// UpdateStatus writes the status guarded by xmin: zero rows means somebody else wrote first.
+// UpdateStatus writes the status guarded by version: zero rows means somebody else wrote first.
 func (r *OrderRepository) UpdateStatus(ctx context.Context, o *order.Order) error {
-	by := actor.FromContext(ctx)
-	row := r.db.Q(ctx).QueryRow(ctx, `
-		UPDATE orders
-		SET    status = $2, updated_at = now(), updated_by = $3
-		WHERE  id = $1 AND xmin = $4
-		RETURNING updated_at, xmin`, o.ID, string(o.Status), by, o.Version)
-	err := row.Scan(&o.UpdatedAt, &o.Version)
-	if errors.Is(err, pgx.ErrNoRows) {
+	// The plugin adds "WHERE version = ?" only for a non-zero version: an order whose version was
+	// never loaded would be written with no concurrency check at all, so it is refused here.
+	if o.Version <= 0 {
+		return fmt.Errorf("orders: update status of %d without a loaded version", o.ID)
+	}
+	m := orderModel{ID: o.ID, Version: optimisticlock.Version{Int64: int64(o.Version), Valid: true}}
+	returning := clause.Returning{Columns: []clause.Column{
+		{Name: "updated_at"}, {Name: "updated_by"}, {Name: "version"},
+	}}
+	res := r.gorm.On(ctx).Model(&m).Clauses(returning).Updates(map[string]any{"status": string(o.Status)})
+	if res.Error != nil {
+		return fmt.Errorf("orders: update status of %d: %w", o.ID, res.Error)
+	}
+	if res.RowsAffected == 0 {
 		return apperror.ConcurrencyConflict()
 	}
-	if err != nil {
-		return fmt.Errorf("orders: update status of %d: %w", o.ID, err)
-	}
-	o.UpdatedBy = by
+	o.UpdatedAt, o.UpdatedBy, o.Version = m.UpdatedAt, m.UpdatedBy, int(m.Version.Int64)
 	return nil
 }
 
-// CancelPendingOlderThan cancels up to limit stale PENDING orders, claiming them with SKIP LOCKED
-// so concurrent reapers never fight over a row, and returns their ids (the caller drops them from
-// the cache).
+// cancelPendingSQL claims stale PENDING orders with SKIP LOCKED, so concurrent reapers never fight
+// over a row. It is Raw SQL — the shape GORM's builder does not express well — and Raw bypasses the
+// optimisticlock plugin, so it bumps version itself: a confirmation racing the reaper must lose.
+const cancelPendingSQL = `
+	UPDATE orders
+	SET    status = ?, updated_at = ?, updated_by = ?, version = version + 1
+	WHERE  id IN (
+		SELECT id FROM orders
+		WHERE  status = ? AND created_at < ?
+		ORDER  BY id
+		LIMIT  ?
+		FOR UPDATE SKIP LOCKED
+	)
+	RETURNING id`
+
+// CancelPendingOlderThan cancels up to limit stale PENDING orders and returns their ids (the
+// caller drops them from the cache).
 func (r *OrderRepository) CancelPendingOlderThan(ctx context.Context, cutoff time.Time, limit int) ([]int, error) {
-	rows, err := r.db.Q(ctx).Query(ctx, `
-		UPDATE orders
-		SET    status = $3, updated_at = now(), updated_by = $4
-		WHERE  id IN (
-			SELECT id FROM orders
-			WHERE  status = $5 AND created_at < $1
-			ORDER  BY id
-			LIMIT  $2
-			FOR UPDATE SKIP LOCKED
-		)
-		RETURNING id`,
-		cutoff, limit, string(order.StatusCancelled), actor.FromContext(ctx), string(order.StatusPending))
+	db := r.gorm.On(ctx)
+	var ids []int
+	err := db.Raw(cancelPendingSQL, string(order.StatusCancelled), db.NowFunc(), actor.FromContext(ctx),
+		string(order.StatusPending), cutoff, limit).Scan(&ids).Error
 	if err != nil {
 		return nil, fmt.Errorf("orders: reap pending: %w", err)
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int])
-	if err != nil {
-		return nil, fmt.Errorf("orders: read reaped ids: %w", err)
 	}
 	return ids, nil
 }
 
-func (r *OrderRepository) itemsFor(ctx context.Context, orderIDs []int) (map[int][]order.Item, error) {
-	out := make(map[int][]order.Item, len(orderIDs))
-	if len(orderIDs) == 0 {
-		return out, nil
+func toModel(o *order.Order) orderModel {
+	m := orderModel{
+		ID:          o.ID,
+		CustomerID:  o.CustomerID,
+		Status:      string(o.Status),
+		TotalAmount: o.TotalAmount,
+		RequestID:   o.RequestID,
+		Items:       make([]orderItemModel, len(o.Items)),
 	}
-	rows, err := r.db.Q(ctx).Query(ctx, `
-		SELECT id, order_id, sku, quantity, unit_price
-		FROM   order_items
-		WHERE  order_id = ANY($1)
-		ORDER  BY id`, orderIDs)
-	if err != nil {
-		return nil, fmt.Errorf("orders: items: %w", err)
+	for i, it := range o.Items {
+		m.Items[i] = orderItemModel{ID: it.ID, SKU: it.SKU, Quantity: it.Quantity, UnitPrice: it.UnitPrice}
 	}
-	items, err := pgx.CollectRows(rows, pgx.RowToStructByName[itemRow])
-	if err != nil {
-		return nil, fmt.Errorf("orders: read items: %w", err)
-	}
-	for _, it := range items {
-		out[it.OrderID] = append(out[it.OrderID],
-			order.Item{ID: it.ID, SKU: it.SKU, Quantity: it.Quantity, UnitPrice: it.UnitPrice})
-	}
-	return out, nil
+	return m
 }
 
-func toDomain(r orderRow) order.Order {
-	return order.Order{
-		ID:          r.ID,
-		CustomerID:  r.CustomerID,
-		Status:      order.Status(r.Status),
-		TotalAmount: r.TotalAmount,
-		Items:       []order.Item{},
-		CreatedAt:   r.CreatedAt,
-		CreatedBy:   r.CreatedBy,
-		UpdatedAt:   r.UpdatedAt,
-		UpdatedBy:   r.UpdatedBy,
-		Version:     r.Version,
+func toDomain(m orderModel) order.Order {
+	o := order.Order{
+		ID:          m.ID,
+		CustomerID:  m.CustomerID,
+		Status:      order.Status(m.Status),
+		TotalAmount: m.TotalAmount,
+		Items:       make([]order.Item, len(m.Items)),
+		CreatedAt:   m.CreatedAt,
+		CreatedBy:   m.CreatedBy,
+		UpdatedAt:   m.UpdatedAt,
+		UpdatedBy:   m.UpdatedBy,
+		RequestID:   m.RequestID,
+		Version:     int(m.Version.Int64),
 	}
+	for i, it := range m.Items {
+		o.Items[i] = order.Item{ID: it.ID, SKU: it.SKU, Quantity: it.Quantity, UnitPrice: it.UnitPrice}
+	}
+	return o
+}
+
+func toDomains(models []orderModel) []order.Order {
+	out := make([]order.Order, len(models))
+	for i, m := range models {
+		out[i] = toDomain(m)
+	}
+	return out
 }

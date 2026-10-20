@@ -16,7 +16,6 @@ import (
 	"example.com/msvcservice/internal/order"
 	"github.com/guangliangus/go-msvc-kit/auth"
 	"github.com/guangliangus/go-msvc-kit/httpx"
-	"github.com/guangliangus/go-msvc-kit/idempotency"
 	"github.com/guangliangus/go-msvc-kit/middleware"
 )
 
@@ -27,7 +26,6 @@ type Deps struct {
 	ErrorWriter *httpx.ErrorWriter
 	Auth        *auth.Validator
 	DevHeaders  *auth.DevHeaders
-	Idempotency idempotency.Store
 	Orders      *order.Service
 	OpenAPI     []byte
 }
@@ -41,7 +39,7 @@ func NewRouter(d Deps) http.Handler {
 	// The API reference is a development convenience: like the header identities it answers only
 	// in the development environment, whatever the configuration says, so a docs_enabled that leaks
 	// into a cluster config map serves nothing. Outside the middleware chain on purpose — a static
-	// page and the document need no auth, idempotency or body cap.
+	// page and the document need no auth, rate limit or body cap.
 	if cfg.HTTP.DocsEnabled && strings.EqualFold(cfg.Environment, auth.DevelopmentEnvironment) {
 		root.Mount("/docs", httpx.Docs(d.OpenAPI))
 	}
@@ -66,8 +64,9 @@ func NewRouter(d Deps) http.Handler {
 	//  4. the request log sits OUTSIDE the recoverer: it records the status the client received,
 	//     and a handled 400 is never logged as a 500;
 	//  5. the request timeout and body cap bound every handler;
-	//  6. authentication before rate limiting (partitions are per caller) and both before
-	//     idempotency (keys are caller-scoped, and a replay still spends budget).
+	//  6. authentication before rate limiting: partitions are per caller. Idempotency is not a
+	//     middleware: what counts as a repeated request is each context's business, kept in its
+	//     own tables (order.Service.Create).
 	root.Group(func(r chi.Router) {
 		r.Use(middleware.ClientIPResolver(cfg.HTTP.ForwardedHeaders))
 		r.Use(middleware.PlatformHeaders())
@@ -82,7 +81,6 @@ func NewRouter(d Deps) http.Handler {
 		r.Use(middleware.CORS(cfg.HTTP.CORS))
 		r.Use(auth.Authenticate(d.Log, d.Auth, d.DevHeaders))
 		r.Use(limiter.Global())
-		r.Use(middleware.Idempotency(cfg.HTTP.Idempotency, d.Idempotency, d.Log))
 
 		ordersHandler := NewOrdersHandler(d.Orders)
 		r.Route("/api/v1", func(r chi.Router) {

@@ -43,10 +43,10 @@ fi
 echo "generating $NAME ($MODULE) into $DEST"
 mkdir -p "$DEST"
 # Excluded: VCS, build output, editor state, the uncommitted workspace file — and the gitignored
-# local secrets (.env, .env.*, *.local.yaml), which must never travel into a new repository.
+# local secrets (.env, .env.*, *.local.yaml, *.local.jsonc), which must never travel into a new repository.
 tar -C "$TEMPLATE_DIR" --exclude .git --exclude bin --exclude dist --exclude '*.test' --exclude coverage.txt \
     --exclude coverage.html --exclude .idea --exclude .vscode --exclude go.work --exclude go.work.sum \
-    --exclude .env --exclude '.env.*' --exclude '*.local.yaml' \
+    --exclude .env --exclude '.env.*' --exclude '*.local.yaml' --exclude '*.local.jsonc' \
     -cf - . | tar -C "$DEST" -xf -
 
 cd "$DEST"

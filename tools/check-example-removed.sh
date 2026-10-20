@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reports every leftover of the orders reference example after it was replaced
 # (docs/replacing-the-example.md): a case-insensitive grep for `\border|inventory|sku\b` over the
-# repository's Go, YAML, SQL, HTTP, shell and JSON files. Prints each hit as file:line:text and
+# repository's Go, YAML, SQL, HTTP, shell, JSON and JSONC files. Prints each hit as file:line:text and
 # exits 1 while any remain, 0 when the tree is clean.
 #
 # Usage: tools/check-example-removed.sh [--context <name>]...
@@ -41,7 +41,7 @@ done
 
 grep_args=(-rnIiE "$PATTERN")
 for d in "${exclude_dirs[@]}"; do grep_args+=("--exclude-dir=$d"); done
-for ext in go yaml yml sql http sh json; do grep_args+=("--include=*.$ext"); done
+for ext in go yaml yml sql http sh json jsonc; do grep_args+=("--include=*.$ext"); done
 grep_args+=(--exclude=check-example-removed.sh --exclude=new-service.sh --exclude='kit_*.sql')
 
 # grep exits 1 when nothing matches; that is the clean case, not an error.

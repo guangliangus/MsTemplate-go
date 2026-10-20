@@ -2,6 +2,7 @@ package order
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -13,8 +14,11 @@ import (
 // that cross a process boundary, or must be swapped in a unit test, belong in this package: pure
 // computation, validation and mapping do not.
 type Repository interface {
-	// Insert stores the order and its items and fills in the ids, audit fields and version.
+	// Insert stores the order and its items and fills in the ids, audit fields and version. An
+	// order whose RequestID the customer already used is refused with ErrDuplicateRequest.
 	Insert(ctx context.Context, o *Order) error
+	// FindByRequestID loads the customer's order created by the request with this id, if any.
+	FindByRequestID(ctx context.Context, customerID, requestID string) (*Order, bool, error)
 	// Get loads an order by id, scoped to a customer when customerID is not empty (404 otherwise).
 	Get(ctx context.Context, id int, customerID string) (*Order, error)
 	// List returns a numbered page of ONE customer's orders, newest first, and that customer's total.
@@ -28,6 +32,10 @@ type Repository interface {
 	// their ids.
 	CancelPendingOlderThan(ctx context.Context, cutoff time.Time, limit int) ([]int, error)
 }
+
+// ErrDuplicateRequest is Repository.Insert's answer to an order whose RequestID the customer already
+// used: a repeated request that got past FindByRequestID because the first one had not committed.
+var ErrDuplicateRequest = errors.New("order: the customer already has an order for this request id")
 
 // Transactor runs fn inside one database transaction carried on the context, so every repository
 // call made with that context joins it; the kit's postgres.DB satisfies it.

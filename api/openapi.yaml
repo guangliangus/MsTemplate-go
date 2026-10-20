@@ -23,15 +23,17 @@ paths:
       description: |
         Prices every line with the inventory service (which also says whether it can be sold; the
         client never states a price), then commits the order and its `orders.order-created.v1`
-        event in one transaction. Send `Idempotency-Key` to make a retried POST safe: the first
-        response is replayed (`Idempotency-Replayed: true`), a duplicate still in flight is a 409
-        `IDEMPOTENCY_IN_FLIGHT`, and while the idempotency store is unreachable the request is
-        refused (503 `IDEMPOTENCY_STORE_UNAVAILABLE` with `Retry-After`) rather than run unprotected.
+        event in one transaction. Send `Idempotency-Key` to make a retried POST safe: the customer
+        gets one order per key, however often the request is repeated or retried concurrently. The
+        first request answers 201; a repeat with the same items answers 200 with that order as it
+        stands now (nothing is priced, created or published again); the key reused for different
+        items is a 422 `ORDER_REQUEST_ID_REUSED`. The key is kept with the order, so it does not
+        expire.
 
-        400 is the request's shape: `VALIDATION_FAILED` lists the fields in `errors`, `BAD_REQUEST`
-        is malformed JSON, `IDEMPOTENCY_KEY_INVALID` a key over 128 characters. 422 is a rule of the
-        order: `ORDER_ITEMS_REQUIRED` (no items), `ORDER_ITEM_INVALID` (more than 100 items),
-        `ORDER_ITEM_UNAVAILABLE`, `ORDER_TOTAL_TOO_LARGE`. 502 `UPSTREAM_SERVICE_UNAVAILABLE` is the
+        400 is the request's shape: `VALIDATION_FAILED` lists the fields in `errors` (an
+        `Idempotency-Key` over 128 characters included), `BAD_REQUEST` is malformed JSON. 422 is a
+        rule of the order: `ORDER_ITEMS_REQUIRED` (no items), `ORDER_ITEM_INVALID` (more than 100
+        items), `ORDER_ITEM_UNAVAILABLE`, `ORDER_TOTAL_TOO_LARGE`, `ORDER_REQUEST_ID_REUSED`. 502 `UPSTREAM_SERVICE_UNAVAILABLE` is the
         inventory service failing or its breaker open; 504 `REQUEST_TIMEOUT` is the server's own
         request deadline.
       parameters:
@@ -47,14 +49,20 @@ paths:
           headers:
             Location: { schema: { type: string } }
             X-Trace-ID: { $ref: '#/components/headers/TraceID' }
-            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        "200":
+          description: A repeat of an earlier request with the same `Idempotency-Key` and items; the order it created
+          headers:
+            Location: { schema: { type: string } }
+            X-Trace-ID: { $ref: '#/components/headers/TraceID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Order' }
         "400": { $ref: '#/components/responses/Problem' }
         "401": { $ref: '#/components/responses/Problem' }
         "403": { $ref: '#/components/responses/Problem' }
-        "409": { $ref: '#/components/responses/Problem' }
         "413": { $ref: '#/components/responses/Problem' }
         "415": { $ref: '#/components/responses/Problem' }
         "422": { $ref: '#/components/responses/Problem' }
@@ -201,6 +209,7 @@ components:
       name: Idempotency-Key
       in: header
       required: false
+      description: The client's id for this request (a UUID, say); one order per customer and key.
       schema: { type: string, maxLength: 128 }
     Page:
       name: page
@@ -230,9 +239,6 @@ components:
     TraceID:
       description: Bare 32-hex trace id of the request, the same value as `traceId` in a problem and `trace_id` in the logs.
       schema: { type: string }
-    IdempotencyReplayed:
-      description: "`true` when the response was replayed from the idempotency store for a repeated `Idempotency-Key`; absent on the first execution."
-      schema: { type: string, enum: ["true"] }
   responses:
     Problem:
       description: RFC 9457 problem details

@@ -25,7 +25,7 @@ build: ## Build the binary into bin/
 
 .PHONY: run
 run: ## Run the API host locally: API on :8080, probes + /metrics on :8081 (compose infrastructure expected)
-	# The development overlay (internal/config/development.yaml) already points the inventory client
+	# The development overlay (internal/config/development.jsonc) already points the inventory client
 	# at the compose WireMock (localhost:8089) — nothing else to set here.
 	APP_ENV=development go run ./cmd/$(BINARY) serve
 
@@ -61,8 +61,8 @@ lint: ## golangci-lint (install: brew install golangci-lint; the pipeline's pin 
 
 # CI tools are pinned in their own module (tools/go.mod, `tool` directives): one version for the
 # laptop and the pipeline, checksum-verified by tools/go.sum, and never mixed into the service's
-# own dependency graph.
-TOOL := go tool -modfile=tools/go.mod
+# own dependency graph. GOWORK=off: -modfile is refused inside a workspace (go work use ../go-msvc-kit).
+TOOL := GOWORK=off go tool -modfile=tools/go.mod
 
 .PHONY: vuln
 vuln: ## govulncheck (pinned in tools/go.mod) against the Go vulnerability database

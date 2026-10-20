@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -18,6 +19,14 @@ import (
 
 // ScopeOrdersRead is the back-office scope that may list every customer's orders.
 const ScopeOrdersRead = "orders.read"
+
+// IdempotencyKeyHeader carries the client's id for a create request: however often the request is
+// retried, the customer gets one order for it (order.Service.Create keeps the guarantee in the
+// database). The header name is the IETF draft's; what counts as a repeat is the order's business.
+const IdempotencyKeyHeader = "Idempotency-Key"
+
+// maxIdempotencyKeyLength bounds the key's shape (a UUID is 36 characters).
+const maxIdempotencyKeyLength = 128
 
 // CreateOrderRequest is the POST body. Wire types live with the handlers that speak them: the
 // JSON and validation tags are this package's concern, and the order package never sees them.
@@ -145,15 +154,27 @@ func (h *OrdersHandler) create(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	requestID := strings.TrimSpace(r.Header.Get(IdempotencyKeyHeader))
+	if len(requestID) > maxIdempotencyKeyLength {
+		return apperror.Validation(map[string][]string{
+			IdempotencyKeyHeader: {"must be at most " + strconv.Itoa(maxIdempotencyKeyLength) + " characters"},
+		})
+	}
 	var req CreateOrderRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		return err
 	}
-	o, err := h.orders.Create(r.Context(), customerID, req.toLines())
+	o, created, err := h.orders.Create(r.Context(), customerID, requestID, req.toLines())
 	if err != nil {
 		return err
 	}
-	return httpx.Created(w, "/api/v1/orders/"+strconv.Itoa(o.ID), toOrderResponse(o))
+	location := "/api/v1/orders/" + strconv.Itoa(o.ID)
+	if !created {
+		// A repeated request: 200 with the order the first one created, as it stands now.
+		w.Header().Set("Location", location)
+		return httpx.WriteJSON(w, http.StatusOK, toOrderResponse(o))
+	}
+	return httpx.Created(w, location, toOrderResponse(o))
 }
 
 func (h *OrdersHandler) get(w http.ResponseWriter, r *http.Request) error {

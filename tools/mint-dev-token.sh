@@ -8,7 +8,7 @@
 #   tools/mint-dev-token.sh [--sub 1] [--realm CONSUMER|BACKOFFICE] [--sid <session id>]
 #                           [--scope "orders.read"] [--ttl <seconds>] [--issuer user-svc] [--key <base64>]
 #
-# The default key is the throwaway one in internal/config/development.yaml. Override it with
+# The default key is the throwaway one in internal/config/development.jsonc. Override it with
 # --key or AUTH_SIGNING_KEY to mint against another deployment; a token for production needs
 # production's key, which this script must never see.
 set -euo pipefail

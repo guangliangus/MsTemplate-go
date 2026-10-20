@@ -29,7 +29,8 @@ Idempotency-Key: demo-0001
 
 { "items": [ { "sku": "SKU-1", "quantity": 2 } ] }
 
-### same key again → replayed response, Idempotency-Replayed: true
+### same key again → 200 with the same order (nothing is created or published twice);
+### the same key with another basket → 422 ORDER_REQUEST_ID_REUSED
 POST {{host}}/api/v1/orders
 Content-Type: application/json
 {{consumer}}

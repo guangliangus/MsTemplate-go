@@ -9,21 +9,13 @@
 
 ---
 
-## 1 · HTTP 幂等不指纹校验请求体（核实 2026-10-12）
+## 1 · （已关闭 2026-10-19）HTTP 幂等不比对请求体
 
-**开着的是什么。** kit 的 `middleware/idempotency.go` 以「调用方 + 方法 + 路径 + key」为键重放，不比对请求体。同一个 key 换一个 payload 会重放第一次的响应。
+通用的 HTTP 幂等中间件已从 kit 删除；幂等改由业务在数据库里做，下单比对商品，同一个 key 换了商品答 422 `ORDER_REQUEST_ID_REUSED`（见 `architecture.md`「幂等由业务在数据库里做」）。编号保留，别处引用的条目号不变。
 
-**代价是什么。** 客户端 bug（key 复用）会拿到一个"看起来成功"但内容不对的响应。平台上的现有服务同样不校验。
+## 2 · （已关闭 2026-10-20）缓存 L1 不跨副本失效
 
-**关掉它需要什么。** 在 `executeAndCapture` 存储时附带请求体的 SHA-256，`TryBegin` 命中时比对，不同则 422 `IDEMPOTENCY_KEY_REUSED`。约半天；要先给 user-svc 的客户端约定这个新错误码。
-
-## 2 · 缓存 L1 不跨副本失效（核实 2026-10-12）
-
-**开着的是什么。** kit 的 `cache.Remove` 只清本副本的 L1 和共享的 L2；别的副本的 L1 最多再服务 `cache.local_ttl`（默认 30s）的旧值。
-
-**代价是什么。** 多副本下一次状态变更后，最长 30s 内另一个 pod 可能读到旧订单状态。对订单状态这类"最终会对"的读可接受。
-
-**关掉它需要什么。** 用 Redis pub/sub 广播失效键（每副本订阅一个频道，收到后删 L1），或把必须实时的读直接走数据库。约一天。
+kit 的两级缓存拆成了两个独立的缓存：订单走只有 Redis 的 `cache.NewRedis`，`Remove` 对每个副本立即生效，没有本地副本能比它活得久；允许旧 N 秒的数据才用 `cache.NewLocal[T]`，它没有 `Remove`，旧度就是它自己的 TTL。拆分留下的代价见第 13 条。编号保留，别处引用的条目号不变。
 
 ## 3 · 进程内限流是 per-pod 额度（核实 2026-10-12）
 
@@ -65,13 +57,13 @@
 
 **关掉它需要什么。** RabbitMQ：整批 `PublishWithDeferredConfirm` 再统一等确认，事务时长降到约一次往返。难点是隔离毒消息：一条让 broker 关闭通道的消息（超过 `max_message_size` 等）会让同批所有未确认的消息都按 nack 返回，直接改会把同批的好事件一起计 attempts、一起停成 FAILED。需要"整批失败且连接仍在时，对未确认的逐条重发一次"的回退，并用一条超大消息的集成测试证明隔离成立。约一天；吞吐真成为瓶颈再做。
 
-## 8 · sqlc / 代码生成（核实 2026-10-17）
+## 8 · GORM 的映射只有部分检查（核实 2026-10-19）
 
-**开着的是什么。** 数据访问是 pgx 原生 SQL + `RowToStructByName`（`internal/postgres`），没有任何代码生成：SQL 写在 Go 字符串里，列名与结构体 `db` tag 的对应靠集成测试（Testcontainers 用 `db/*.sql` 建库）和运行时发现，不靠编译期。
+**开着的是什么。** 数据访问用 GORM（README 决策记录"数据访问"），模型结构体与 `db/*.sql` 的 DDL 靠人工同步，没有编译期检查。已有的守卫是 `tests/integration` 的 `TestEveryGormModelMatchesTheSchema`：对 `postgres.Models()` 里每个模型在 Testcontainers 库上执行一次查询（`QueryFields` 让它逐列点名），模型写了表里没有的列就红。仍然只在执行时才暴露的：类型不配（表是空的就扫不到）、表里有而模型漏掉的列、`Raw` 语句里的一切（而且 Raw 绕过钩子与乐观锁插件）。
 
-**代价是什么。** 一条写错列名的查询要到集成测试或运行时才红；仓储里有重复的行映射样板。sqlc 能从 `db/*.sql` 的 DDL 和 `.sql` 查询文件生成类型安全的 Go 代码，与"DDL 手写是唯一真相"不冲突（它读 DDL，不生成迁移）。
+**代价是什么。** 这几类错误要到覆盖了那条语句的集成测试、或者线上才红；没加进 `Models()` 的新模型连列名也不检查。
 
-**关掉它需要什么。** 把 sqlc 钉进 `tools/go.mod`（`go tool -modfile=tools/go.mod sqlc generate`，与其他 CI 工具一个管法），`sqlc.yaml` 指向 `db/` 做 schema、`internal/postgres/queries/*.sql` 做查询，生成的包只给 `internal/postgres` 用，端口接口不变；CI 加一步"生成后 `git diff --exit-code`"防止生成物过期。要先确认 sqlc 在团队的工具链上能生成（它需要 cgo 工具链，这是当初没默认启用的原因），并决定生成物是否入库。约一天；仓储数量上去、列名错误真的咬过人再做。
+**关掉它需要什么。** 改用 sqlc（按 DDL 生成代码、编译期检查，kit 的 `database/sql` 事务层同样能用，`sql_package: database/sql`），代价是丢掉 GORM 的关联加载与动态条件写法，约一天；或者守卫里给每个模型插一行再读回来，把类型也覆盖到，约半天。
 
 ## 9 · Kafka 的死信 topic 没有回放工具（核实 2026-10-19）
 
@@ -104,6 +96,14 @@
 **代价是什么。** `kafka.tls` / `kafka.sasl` 只有配置校验的单测，握手与鉴权的问题要到第一次连真集群才暴露。rebalance 路径只在扩缩容和滚动发布时走到；设计上是至少一次 + inbox，最坏是重复，但没有测试证明它不会提交一条没处理完的 record。
 
 **关掉它需要什么。** `testutil` 的 Kafka 容器加一个 SASL_SSL listener（自签证书 + SCRAM 用户），集成测试连它；加一个两成员场景：handler 阻塞时起第二个成员触发 rebalance，断言每条 record 都被处理、没有一条在处理完之前被提交。约一天。在那之前，接真集群的第一个服务先在目标环境用 `KAFKA__TLS` / `KAFKA__SASL__*` 冒烟一次。
+
+## 13 · 订单缓存没有进程内一层（核实 2026-10-20）
+
+**开着的是什么。** 订单的缓存只有 Redis（`cache.NewRedis`）：每次命中都是一次 Redis 往返，同一 pod 上并发查同一个 key 才合并成一次。Redis 不可达时缓存 fail-open，订单读全部回源到数据库，没有本地副本垫着。
+
+**代价是什么。** 每次命中多一次集群内往返（亚毫秒级，仍远比回源两条 SQL 便宜）；Redis 的 QPS 等于订单读的 QPS（同 key 并发合并后）；Redis 故障期间数据库承担全部订单读。订单按客户读、没有热点 key，所以现在都可以接受。
+
+**关掉它需要什么。** 某个 key 真成了热点（或 Redis 成了瓶颈），在调用处给它套一层 `cache.NewLocal[order.Order]`：`local.GetOrCreate(ctx, k, func(ctx) { return cache.GetOrCreate(ctx, shared, k, 0, load) })`，TTL 就是这类读接受的跨副本旧度，并在 `architecture.md` 写明哪些读可能旧这么久。约半天。不要把本地层放回共享缓存内部：那正是第 2 条关掉的问题。
 
 ---
 

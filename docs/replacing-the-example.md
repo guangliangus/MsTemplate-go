@@ -23,9 +23,9 @@
 
 | 文件 | 里面是什么 | 做法 |
 |---|---|---|
-| `internal/postgres/order_repository.go` | `OrderRepository`：原生 SQL、`db.Q(ctx)` 取执行器、`actor.FromContext` 写审计列、`xmin` 乐观并发、keyset 分页 | 删，写你的 `<ctx>_repository.go`；包名 `postgres` 不变，守卫表里就是这个名字 |
+| `internal/postgres/order_repository.go` | `OrderRepository`：`orderModel` / `orderItemModel` 两个 GORM 模型（映射 DDL、钩子写审计列、`optimisticlock.Version`）、`r.gorm.On(ctx)` 取会话、`Preload` 加载明细、keyset 分页、reaper 的 Raw SQL | 删，写你的 `<ctx>_repository.go`；包名 `postgres` 不变，守卫表里就是这个名字。`gorm.go`（`OpenGorm` / `Gorm.On`）是通用的，**保留**，只把 `Models()` 里的两个示例模型换成你的（映射守卫按它逐个检查） |
 | `internal/inventory/`（`client.go`、`client_test.go`） | 下游库存服务的适配器：`httpclient.Doer` 之上的类型化客户端，404 → 不可售、5xx → 502、无价格 → 502 | 没有同类下游就**整个目录删掉**；有就改名成你的下游（`internal/<下游名>`），并把新名字写进第 7 节的两张表 |
-| `db/0001_init.sql` | `orders` / `order_items` 两张表 | 换成你的 `0001_init.sql`（规范见 `db/README.md`，`tests/arch/ddl_test.go` 会查）。`db/kit_*.sql` 是 kit 的表，**不动** |
+| `db/0001_init.sql`、`db/0002_orders_version.sql`、`db/0003_orders_request_id.sql` | `orders` / `order_items` 两张表、`orders.version` 列、下单幂等的 `orders.request_id` 与唯一索引 | 删 `0002_orders_version.sql` 与 `0003_orders_request_id.sql`（你的写要幂等时照 0003 的形状加），换成你的 `0001_init.sql`（规范见 `db/README.md`，`tests/arch/ddl_test.go` 会查）。`db/kit_*.sql` 是 kit 的表，**不动** |
 
 ## 3 · 入口：HTTP、消费者、任务
 
@@ -46,7 +46,7 @@
 |---|---|---|
 | `app.go` 第 23–24 行 | import `internal/inventory`、`internal/order` | 换成你的包 |
 | `app.go` 第 154 行、第 132 行 | `dependencies.orders *order.Service`、`httpapi.Deps{Orders: deps.orders}` | 换成你的服务字段 |
-| `app.go` 的 `build`，第 201–213 行 | `httpclient.New("inventory", cfg.ServiceClients["inventory"], …)` 与 `order.NewService(postgres.NewOrderRepository(db), db, inventory.New(inventoryHTTP), messaging.NewOutboxPublisher(db), cache.New(…), log)` | 换成你的仓储、下游客户端、服务；没有下游就删掉 `httpclient.New` 那一段 |
+| `app.go` 的 `build`，第 201–213 行 | `httpclient.New("inventory", cfg.ServiceClients["inventory"], …)` 与 `order.NewService(postgres.NewOrderRepository(db), db, inventory.New(inventoryHTTP), messaging.NewOutboxPublisher(db), cache.NewRedis(…), log)` | 换成你的仓储、下游客户端、服务；没有下游就删掉 `httpclient.New` 那一段 |
 | `app.go` 的 `registerTasks`，第 222–225 行 | `runner.Recurring("pending-orders-reaper", time.Minute, tasks.NewPendingOrdersReaper(d.orders, cfg.Orders.PendingTimeout, log))` 与它上面的注释 | 删或换成你的任务；`Heartbeat` 那一行可留 |
 | `messaging.go` 第 9 行、`subscriptions`（第 51–57 行） | import `internal/order`；`messaging.Subscribe(order.EventCreated, messaging.QueueName(cfg.Service.Name, order.EventCreated), inbox, consumers.NewOrderCreatedHandler(…))` | 换成你的订阅，只声明一次（`splitByBus` 按 `kafka.events` 交给 RabbitMQ 或 Kafka）；队列名 / consumer group 一律从 `messaging.QueueName` 取（第 9 节的 KEDA 陷阱）。两条总线的装配（`registerRabbitMQ` / `registerKafka`）不动 |
 | `messaging_test.go` 第 13–14 行 | `splitByBus` 测试的夹具用 `orders.order-*` 事件名 | 随手换成你的（任何名字都行，它只测拆分） |
@@ -58,8 +58,8 @@
 | 文件 | 里面是什么 | 做法 |
 |---|---|---|
 | `internal/config/config.go` | `Config.Orders OrdersConfig`（第 57 行）、`OrdersConfig`（第 145–149 行） | 换成你的段，或删掉 |
-| `internal/config/default.yaml` | `kafka.events` 注释里的示例事件名（第 173 行）；`tasks.recurring.pending-orders-reaper`（第 241–242 行）、`service_clients.inventory`（第 266–279 行）、`orders:`（第 281–284 行） | 任务覆盖与 `orders:` 跟着第 4、5 节删；`service_clients.inventory` 改成你的下游名（没有下游就留空 map：`service_clients: {}`）；注释里的事件名换成你的。 |
-| `internal/config/development.yaml` | `kafka` 注释里的 `KAFKA__EVENTS=orders.order-created.v1`（第 19–20 行）；`service_clients.inventory.base_url` 指向 compose 的 WireMock（第 24–27 行） | 事件名换成你的；下游跟着改或删 |
+| `internal/config/default.jsonc` | `kafka.events` 注释里的示例事件名（第 191 行）；`tasks.recurring.pending-orders-reaper`（第 262–264 行）、`service_clients.inventory`（第 291–312 行）、`"orders"`（第 314–318 行） | 任务覆盖与 `"orders"` 跟着第 4、5 节删（删掉最后一节后，上一节 `}` 后面的逗号可留可删，kit 接受尾逗号）；`service_clients.inventory` 改成你的下游名（没有下游就留空对象：`"service_clients": {}`）；注释里的事件名换成你的。 |
+| `internal/config/development.jsonc` | `kafka` 注释里的 `KAFKA__EVENTS=orders.order-created.v1`（第 20–21 行）；`service_clients.inventory.base_url` 指向 compose 的 WireMock（第 27–32 行） | 事件名换成你的；下游跟着改或删 |
 | `internal/config/config_test.go` | Kafka 路由与校验的测试（第 105–128 行）用 `orders.order-created.v1` 等作夹具 | 换成你的事件名（任何合法名字都行），断言不动 |
 
 ## 6 · API 文档与请求样例
@@ -67,7 +67,7 @@
 | 文件 | 里面是什么 | 做法 |
 |---|---|---|
 | `api/openapi.yaml` | `paths` 里 `/api/v1/orders`、`/api/v1/orders/{id}`、`/api/v1/backoffice/orders`（第 19–152 行）；`components.schemas` 里 `CreateOrderRequest` / `CreateOrderItem` / `Order` / `OrderItem` / `OrderPage` / `OrderCursorPage`（第 265 行起）；`info.description` 与 `tags` | 换成你的路径与 schema。**保留**：Operational 四条路径、`securitySchemes`、`parameters`（分页语义）、`headers`、`responses.Problem`、`schemas.Problem`。路由↔文档的守卫（`openapi_test.go`）会在 `go test` 时逼你两边一致 |
-| `requests.http` | 走一遍 orders 流程 | 换成你的流程；探针、401、幂等重放、400/422/404/409、两个平面这些段落按你的 API 改一遍 |
+| `requests.http` | 走一遍 orders 流程 | 换成你的流程；探针、401、幂等下单、400/422/404/409、两个平面这些段落按你的 API 改一遍 |
 
 ## 7 · 守卫与集成测试
 
@@ -123,10 +123,10 @@
 
 ```bash
 make lint && make test                 # 守卫在检查你的包；locales、OpenAPI↔路由、DDL 规范都过
-tools/check-example-removed.sh         # 退出码 0：Go / YAML / SQL / HTTP / sh / JSON 里没有 order / inventory / sku
+tools/check-example-removed.sh         # 退出码 0：Go / YAML / SQL / HTTP / sh / JSON(C) 里没有 order / inventory / sku
                                        # 你自己的上下文恰好叫这些名字时：--context <name>
 make up && make run                    # requests.http 走一遍
 tools/e2e.sh --no-app                  # 改完 tools/e2e.sh 之后
 ```
 
-`check-example-removed.sh` 只认 Go / YAML / SQL / HTTP / sh / JSON，不扫 Markdown；它把 SQL 的 `ORDER BY` 和英文里当普通单词用的 `order`（start order、stop order）排除在外，示例一律以标识符的形态出现（`orders`、`order.`、`/order`、`Order…`、`ORDER_…`），漏不掉。
+`check-example-removed.sh` 只认 Go / YAML / SQL / HTTP / sh / JSON / JSONC，不扫 Markdown；它把 SQL 的 `ORDER BY` 和英文里当普通单词用的 `order`（start order、stop order）排除在外，示例一律以标识符的形态出现（`orders`、`order.`、`/order`、`Order…`、`ORDER_…`），漏不掉。

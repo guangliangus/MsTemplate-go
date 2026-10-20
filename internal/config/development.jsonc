@@ -1,42 +1,49 @@
-# Applied on top of default.yaml when APP_ENV=development (the default for `go run`): the compose
-# stack's addresses and the conveniences that must never reach a cluster. default.yaml carries no
-# connection string at all, so these are the only place a localhost lives.
-http:
-  docs_enabled: true
-
-telemetry:
-  otlp_endpoint: http://localhost:4317
-
-postgres:
-  dsn: postgres://msvc:msvc@localhost:5432/msvcservice?sslmode=disable
-
-redis:
-  addr: localhost:6379
-
-rabbitmq:
-  url: amqp://guest:guest@localhost:5672/
-
-# The compose Kafka (`docker compose --profile kafka up -d`). Still off: turn it on for a run with
-# KAFKA__ENABLED=true KAFKA__EVENTS=orders.order-created.v1 make run.
-kafka:
-  brokers: [localhost:9092]
-
-service_clients:
-  inventory:
-    # The compose WireMock stub (deploy/compose/wiremock).
-    base_url: http://localhost:8089/
-
-logging:
-  level: debug
-  format: text
-
-auth:
-  # The throwaway key user-svc ships in ITS development settings ("dev-only-access-token-key-32byte"),
-  # so a token from a locally running user-svc — or one minted by tools/mint-dev-token.sh —
-  # validates here with no setup. It is in the repository, so it is not a secret, which is exactly
-  # why production supplies AUTH__SIGNING_KEY from a Secret.
-  signing_key: ZGV2LW9ubHktYWNjZXNzLXRva2VuLWtleS0zMmJ5dGU=
-  # Header identities for `go run` + curl: -H 'X-Dev-Subject: 1' -H 'X-Dev-Realm: CONSUMER'.
-  # Refused outside the development environment even if set.
-  dev_headers:
-    enabled: true
+// Applied on top of default.jsonc when APP_ENV=development (the default for `go run`): the compose
+// stack's addresses and the conveniences that must never reach a cluster. default.jsonc carries no
+// connection string at all, so these are the only place a localhost lives.
+{
+  "http": {
+    "docs_enabled": true
+  },
+  "telemetry": {
+    "otlp_endpoint": "http://localhost:4317"
+  },
+  "postgres": {
+    "dsn": "postgres://msvc:msvc@localhost:5432/msvcservice?sslmode=disable"
+  },
+  "redis": {
+    "addr": "localhost:6379"
+  },
+  "rabbitmq": {
+    "url": "amqp://guest:guest@localhost:5672/"
+  },
+  // The compose Kafka (`docker compose --profile kafka up -d`). Still off: turn it on for a run with
+  // KAFKA__ENABLED=true KAFKA__EVENTS=orders.order-created.v1 make run.
+  "kafka": {
+    "brokers": [
+      "localhost:9092"
+    ]
+  },
+  "service_clients": {
+    "inventory": {
+      // The compose WireMock stub (deploy/compose/wiremock).
+      "base_url": "http://localhost:8089/"
+    }
+  },
+  "logging": {
+    "level": "debug",
+    "format": "json"
+  },
+  "auth": {
+    // The throwaway key user-svc ships in ITS development settings ("dev-only-access-token-key-32byte"),
+    // so a token from a locally running user-svc — or one minted by tools/mint-dev-token.sh —
+    // validates here with no setup. It is in the repository, so it is not a secret, which is exactly
+    // why production supplies AUTH__SIGNING_KEY from a Secret.
+    "signing_key": "ZGV2LW9ubHktYWNjZXNzLXRva2VuLWtleS0zMmJ5dGU=",
+    // Header identities for `go run` + curl: -H 'X-Dev-Subject: 1' -H 'X-Dev-Realm: CONSUMER'.
+    // Refused outside the development environment even if set.
+    "dev_headers": {
+      "enabled": true
+    }
+  }
+}

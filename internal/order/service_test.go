@@ -13,7 +13,6 @@ import (
 	"example.com/msvcservice/internal/order"
 	"example.com/msvcservice/internal/order/ordertest"
 	"github.com/guangliangus/go-msvc-kit/apperror"
-	"github.com/guangliangus/go-msvc-kit/cache"
 )
 
 // twoEach is these tests' inventory: every SKU sells at 2 per unit, so totals are easy to read.
@@ -28,8 +27,8 @@ func lines(skus ...string) []order.Line {
 }
 
 func TestCreateCommitsOrderAndEventTogether(t *testing.T) {
-	svc, repo, pub := ordertest.NewService(twoEach)
-	o, err := svc.Create(context.Background(), "c1", lines("A", "B"))
+	svc, repo, pub := ordertest.NewService(t, twoEach)
+	o, _, err := svc.Create(context.Background(), "c1", "", lines("A", "B"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,8 +46,8 @@ func TestCreateCommitsOrderAndEventTogether(t *testing.T) {
 }
 
 func TestCreateRefusesUnavailableAndPropagatesUpstreamErrors(t *testing.T) {
-	svc, _, pub := ordertest.NewService(ordertest.Inventory{UnitPrice: twoEach.UnitPrice, Unavailable: map[string]bool{"B": true}})
-	_, err := svc.Create(context.Background(), "c1", lines("A", "B"))
+	svc, _, pub := ordertest.NewService(t, ordertest.Inventory{UnitPrice: twoEach.UnitPrice, Unavailable: map[string]bool{"B": true}})
+	_, _, err := svc.Create(context.Background(), "c1", "", lines("A", "B"))
 	if e, _ := apperror.As(err); e == nil || e.Code != order.CodeItemUnavailable || e.Status != 422 {
 		t.Fatalf("got %v", err)
 	}
@@ -57,15 +56,15 @@ func TestCreateRefusesUnavailableAndPropagatesUpstreamErrors(t *testing.T) {
 	}
 
 	down := apperror.Upstream("inventory", "down", errors.New("x"))
-	svc, _, _ = ordertest.NewService(ordertest.Inventory{Err: down})
-	if _, err := svc.Create(context.Background(), "c1", lines("A")); !errors.Is(err, down) {
+	svc, _, _ = ordertest.NewService(t, ordertest.Inventory{Err: down})
+	if _, _, err := svc.Create(context.Background(), "c1", "", lines("A")); !errors.Is(err, down) {
 		t.Fatalf("upstream errors pass through: %v", err)
 	}
 }
 
 func TestGetScopesByCustomerWithoutLeaking(t *testing.T) {
-	svc, _, _ := ordertest.NewService(twoEach)
-	o, _ := svc.Create(context.Background(), "c1", lines("A"))
+	svc, _, _ := ordertest.NewService(t, twoEach)
+	o, _, _ := svc.Create(context.Background(), "c1", "", lines("A"))
 	if _, err := svc.Get(context.Background(), o.ID, "c1"); err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +77,8 @@ func TestGetScopesByCustomerWithoutLeaking(t *testing.T) {
 }
 
 func TestConfirmIsIdempotentAndCancelFollowsTheRules(t *testing.T) {
-	svc, repo, _ := ordertest.NewService(twoEach)
-	o, _ := svc.Create(context.Background(), "c1", lines("A"))
+	svc, repo, _ := ordertest.NewService(t, twoEach)
+	o, _, _ := svc.Create(context.Background(), "c1", "", lines("A"))
 	if err := svc.Confirm(context.Background(), o.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +101,8 @@ func TestConfirmIsIdempotentAndCancelFollowsTheRules(t *testing.T) {
 // The line rules run before anything is priced: no downstream call for an order that could never
 // be accepted, whether a line is wrong or there are too many of them.
 func TestCreateChecksTheRequestBeforeCallingInventory(t *testing.T) {
-	svc, _, _ := ordertest.NewService(ordertest.Inventory{Err: errors.New("inventory must not be called")})
-	_, err := svc.Create(context.Background(), "c1", []order.Line{{SKU: "A", Quantity: 0}})
+	svc, _, _ := ordertest.NewService(t, ordertest.Inventory{Err: errors.New("inventory must not be called")})
+	_, _, err := svc.Create(context.Background(), "c1", "", []order.Line{{SKU: "A", Quantity: 0}})
 	if e, _ := apperror.As(err); e == nil || e.Code != order.CodeItemInvalid {
 		t.Fatalf("got %v", err)
 	}
@@ -111,11 +110,11 @@ func TestCreateChecksTheRequestBeforeCallingInventory(t *testing.T) {
 	for i := range tooMany {
 		tooMany[i] = order.Line{SKU: "A", Quantity: 1}
 	}
-	_, err = svc.Create(context.Background(), "c1", tooMany)
+	_, _, err = svc.Create(context.Background(), "c1", "", tooMany)
 	if e, _ := apperror.As(err); e == nil || e.Code != order.CodeItemInvalid || e.Status != 422 {
 		t.Fatalf("got %v", err)
 	}
-	_, err = svc.Create(context.Background(), "c1", nil)
+	_, _, err = svc.Create(context.Background(), "c1", "", nil)
 	if e, _ := apperror.As(err); e == nil || e.Code != order.CodeItemsRequired || e.Status != 422 {
 		t.Fatalf("got %v", err)
 	}
@@ -124,9 +123,9 @@ func TestCreateChecksTheRequestBeforeCallingInventory(t *testing.T) {
 // The consumer confirms inside the inbox transaction: a read that lands before the commit must not
 // find the entry already gone (it would cache the uncommitted-away PENDING row for a whole TTL).
 func TestStatusChangesInvalidateTheCacheOnlyAfterCommit(t *testing.T) {
-	svc, _, _ := ordertest.NewService(twoEach)
+	svc, _, _ := ordertest.NewService(t, twoEach)
 	ctx := context.Background()
-	o, _ := svc.Create(ctx, "c1", lines("A"))
+	o, _, _ := svc.Create(ctx, "c1", "", lines("A"))
 	if got, _ := svc.Get(ctx, o.ID, "c1"); got.Status != order.StatusPending { // now cached
 		t.Fatal(got.Status)
 	}
@@ -148,9 +147,9 @@ func TestStatusChangesInvalidateTheCacheOnlyAfterCommit(t *testing.T) {
 }
 
 func TestReapingInvalidatesEveryCancelledOrder(t *testing.T) {
-	svc, _, _ := ordertest.NewService(twoEach)
+	svc, _, _ := ordertest.NewService(t, twoEach)
 	ctx := context.Background()
-	o, _ := svc.Create(ctx, "c1", lines("A"))
+	o, _, _ := svc.Create(ctx, "c1", "", lines("A"))
 	_, _ = svc.Get(ctx, o.ID, "c1") // cached as PENDING
 	n, err := svc.ReapPending(ctx, time.Minute)
 	if err != nil || n != 1 {
@@ -164,11 +163,11 @@ func TestReapingInvalidatesEveryCancelledOrder(t *testing.T) {
 // One run drains a backlog larger than a batch: the reaper keeps going until a short batch
 // comes back, rather than leaving the rest for the next minute.
 func TestReapPendingDrainsABacklogAboveTheBatchSize(t *testing.T) {
-	svc, repo, _ := ordertest.NewService(twoEach)
+	svc, repo, _ := ordertest.NewService(t, twoEach)
 	ctx := context.Background()
 	backlog := 2*order.ReapBatchSize + 1
 	for range backlog {
-		if _, err := svc.Create(ctx, "c1", lines("A")); err != nil {
+		if _, _, err := svc.Create(ctx, "c1", "", lines("A")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -204,10 +203,79 @@ func (r *endlessBacklog) CancelPendingOlderThan(_ context.Context, _ time.Time, 
 func TestReapPendingIsBoundedPerRun(t *testing.T) {
 	repo := &endlessBacklog{Repo: ordertest.NewRepo()}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := cache.New(cache.Config{DefaultTTL: time.Minute, LocalTTL: time.Minute, LocalMaxEntries: 10}, nil, log)
+	c := ordertest.NewCache(t)
 	svc := order.NewService(repo, ordertest.Transactor{}, twoEach, &ordertest.Publisher{}, c, log)
 	n, err := svc.ReapPending(context.Background(), time.Minute)
 	if err != nil || repo.batches != order.MaxReapBatches || n != int64(order.MaxReapBatches*order.ReapBatchSize) {
 		t.Fatalf("reaped %d in %d batches: %v", n, repo.batches, err)
+	}
+}
+
+// A request id makes a create idempotent per customer: the repeat gets the first order back
+// (created=false) and nothing is written or published again; the same id from another customer is
+// another request, and the id reused for a different basket is refused, not answered with the
+// first basket's order.
+func TestCreateIsIdempotentPerCustomerAndRequestID(t *testing.T) {
+	svc, repo, pub := ordertest.NewService(t, twoEach)
+	ctx := context.Background()
+	first, created, err := svc.Create(ctx, "c1", "key-1", lines("A", "B"))
+	if err != nil || !created {
+		t.Fatalf("first: created=%v err=%v", created, err)
+	}
+	again, created, err := svc.Create(ctx, "c1", "key-1", lines("A", "B"))
+	if err != nil || created || again.ID != first.ID {
+		t.Fatalf("repeat: %+v created=%v err=%v", again, created, err)
+	}
+	if len(repo.InTx()) != 1 || len(pub.Events()) != 1 {
+		t.Fatalf("the repeat wrote or published again: writes=%v events=%d", repo.InTx(), len(pub.Events()))
+	}
+
+	other, created, err := svc.Create(ctx, "c2", "key-1", lines("A", "B"))
+	if err != nil || !created || other.ID == first.ID {
+		t.Fatalf("the same id from another customer is another request: %+v created=%v err=%v", other, created, err)
+	}
+	_, _, err = svc.Create(ctx, "c1", "key-1", lines("A"))
+	if e, _ := apperror.As(err); e == nil || e.Code != order.CodeRequestIDReused || e.Status != 422 {
+		t.Fatalf("an id reused for another basket: %v", err)
+	}
+	for range 2 {
+		if _, created, err := svc.Create(ctx, "c1", "", lines("A")); err != nil || !created {
+			t.Fatalf("without an id every request creates: created=%v err=%v", created, err)
+		}
+	}
+}
+
+// missOnce hides the first lookup, as when a repeat reaches the lookup before the first request
+// committed and reaches the insert after it did.
+type missOnce struct {
+	*ordertest.Repo
+	missed bool
+}
+
+func (r *missOnce) FindByRequestID(ctx context.Context, customerID, requestID string) (*order.Order, bool, error) {
+	if !r.missed {
+		r.missed = true
+		return nil, false, nil
+	}
+	return r.Repo.FindByRequestID(ctx, customerID, requestID)
+}
+
+func TestARepeatThatRacedTheFirstRequestGetsItsOrder(t *testing.T) {
+	svc, repo, pub := ordertest.NewService(t, twoEach)
+	ctx := context.Background()
+	first, _, err := svc.Create(ctx, "c1", "key-1", lines("A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := ordertest.NewCache(t)
+	racing := order.NewService(&missOnce{Repo: repo}, ordertest.Transactor{}, twoEach, pub, c, log)
+	again, created, err := racing.Create(ctx, "c1", "key-1", lines("A"))
+	if err != nil || created || again.ID != first.ID {
+		t.Fatalf("the insert's duplicate is answered with the first order: %+v created=%v err=%v", again, created, err)
+	}
+	if len(pub.Events()) != 1 {
+		t.Fatalf("the refused insert published nothing: %d events", len(pub.Events()))
 	}
 }

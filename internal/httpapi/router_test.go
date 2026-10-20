@@ -50,7 +50,7 @@ func testServer(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc, _, _ := ordertest.NewService(testInventory)
+	svc, _, _ := ordertest.NewService(t, testInventory)
 	return NewRouter(Deps{
 		Config:      cfg,
 		Log:         quiet,
@@ -125,7 +125,7 @@ func TestAuthenticationAndPlanes(t *testing.T) {
 // The handlers never dereference a missing principal: a route mounted without RequireRealm by
 // mistake answers 401 instead of panicking.
 func TestHandlersRefuseARequestWithoutAPrincipal(t *testing.T) {
-	svc, _, _ := ordertest.NewService(testInventory)
+	svc, _, _ := ordertest.NewService(t, testInventory)
 	routes := NewOrdersHandler(svc).ConsumerRoutes(middleware.NewRateLimiter(rateLimits, quiet))
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodPost, "/", `{"items":[{"sku":"A","quantity":1}]}`},
@@ -189,6 +189,32 @@ func TestOrderFlow(t *testing.T) {
 	}
 	if p := problem(t, call(h, http.MethodDelete, "/api/v1/orders/1", "", consumer)); p.Status != 409 || p.ErrorCode != order.CodeNotCancellable {
 		t.Fatalf("cancel twice: %+v", p)
+	}
+}
+
+// A create carrying Idempotency-Key is answered once with 201 and, when repeated, with 200 and the
+// same order; the key's shape is the handler's (400), the meaning of a repeat the order's (422).
+func TestCreateWithAnIdempotencyKey(t *testing.T) {
+	h := testServer(t)
+	keyed := map[string]string{IdempotencyKeyHeader: "  key-1  "}
+	for k, v := range consumer {
+		keyed[k] = v
+	}
+	body := `{"items":[{"sku":"A","quantity":2}]}`
+	first := call(h, http.MethodPost, "/api/v1/orders", body, keyed)
+	again := call(h, http.MethodPost, "/api/v1/orders", body, keyed)
+	if first.Code != 201 || again.Code != 200 || again.Header().Get("Location") != first.Header().Get("Location") ||
+		again.Body.String() != first.Body.String() {
+		t.Fatalf("first %d %s, again %d %s", first.Code, first.Body.String(), again.Code, again.Body.String())
+	}
+	if p := problem(t, call(h, http.MethodPost, "/api/v1/orders", `{"items":[{"sku":"B","quantity":1}]}`, keyed)); p.Status != 422 ||
+		p.ErrorCode != order.CodeRequestIDReused {
+		t.Fatalf("a key reused for another basket: %+v", p)
+	}
+	keyed[IdempotencyKeyHeader] = strings.Repeat("k", 129)
+	if p := problem(t, call(h, http.MethodPost, "/api/v1/orders", body, keyed)); p.Status != 400 ||
+		len(p.Errors[IdempotencyKeyHeader]) == 0 {
+		t.Fatalf("an over-long key is a 400 naming the header: %+v", p)
 	}
 }
 

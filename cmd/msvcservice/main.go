@@ -51,5 +51,10 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: msvcservice [serve|worker|version]")
+	fmt.Fprint(os.Stderr, `usage: msvcservice [serve|worker|version]
+
+There are no flags: configuration comes from the environment.
+  APP_ENV=development   applies internal/config/development.jsonc (unset means production)
+  SECTION__KEY=value    overrides any configuration key, e.g. SERVER__ADDR=:9090
+`)
 }

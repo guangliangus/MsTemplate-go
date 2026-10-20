@@ -49,12 +49,18 @@ linters:
               desc: "the router is chi"
             - pkg: "github.com/labstack/echo"
               desc: "the router is chi"
-            - pkg: "gorm.io/gorm"
-              desc: "data access is pgx with plain SQL"
             - pkg: "github.com/sirupsen/logrus"
               desc: "logging is log/slog"
             - pkg: "go.uber.org/zap"
               desc: "logging is log/slog"
+        # GORM is the postgres adapter's detail: the models, the hooks and Gorm.On live in
+        # internal/postgres, and everything else sees the context's ports. The composition root
+        # opens it through postgres.OpenGorm, so it needs no GORM import either.
+        gorm-stays-in-the-adapter:
+          files: ["**/internal/**", "!**/internal/postgres/**"]
+          deny:
+            - pkg: "gorm.io"
+              desc: "GORM belongs to internal/postgres; use the context's ports (or postgres.OpenGorm in app)"
         # The business packages import no driver and no adapter: ports in, implementations beside
         # them. Matched by exclusion so the rule survives renaming internal/order or adding a second
         # context beside it: everything under internal/ EXCEPT the packages allowed to see drivers

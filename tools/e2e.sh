@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end acceptance against the compose stack:
 #   probes & /metrics on the admin port (and not on the API port) → token minted like user-svc's → 401 / 403 / forged-key 401 → create order
-#   → outbox → RabbitMQ → consumer confirms → 400 / 422 error contract → idempotent replay
+#   → outbox → RabbitMQ → consumer confirms → 400 / 422 error contract → idempotent create (same key: 200, same order;
+#   reused for another basket: 422)
 #   → rate limit (429) → circuit breaker (502 via the WireMock FAULT SKU) → RabbitMQ restart,
 #   automatic reconnect, one more order.
 # Usage: tools/e2e.sh [--keep] [--no-app [--up]]
@@ -115,11 +116,16 @@ TOTAL=$(echo "$ORDER" | json '["totalAmount"]')
 echo "order id=$ORDER_ID total=$TOTAL"
 [ "$TOTAL" = "39.98" ] || fail "the inventory service prices the line (2 x 19.99), as a JSON number: $ORDER"
 
-log "idempotent replay with the same key"
-REPLAY_HEADERS=$(curl -s -D - -o /dev/null -X POST "$API/api/v1/orders" "${AUTH[@]}" -H 'Content-Type: application/json' \
+log "idempotent create: the same key answers 200 with the same order; reused for another basket, 422"
+REPLAY_HEADERS=$(mktemp)
+REPLAY=$(curl -fsS -D "$REPLAY_HEADERS" -X POST "$API/api/v1/orders" "${AUTH[@]}" -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $KEY" -d '{"items":[{"sku":"SKU-E2E","quantity":2}]}')
-echo "$REPLAY_HEADERS" | grep -qi "Idempotency-Replayed: true" || fail "replay not marked"
-echo "$REPLAY_HEADERS" | grep -qi "X-Trace-ID:" || fail "X-Trace-ID header missing"
+head -1 "$REPLAY_HEADERS" | grep -q " 200" || fail "a repeated create is a 200: $(head -1 "$REPLAY_HEADERS")"
+grep -qi "X-Trace-ID:" "$REPLAY_HEADERS" || fail "X-Trace-ID header missing"
+rm -f "$REPLAY_HEADERS"
+[ "$(echo "$REPLAY" | json '["id"]')" = "$ORDER_ID" ] || fail "the repeat answered with another order: $REPLAY"
+[ "$(status -X POST "$API/api/v1/orders" "${AUTH[@]}" -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  -d '{"items":[{"sku":"SKU-E2E","quantity":3}]}')" = 422 ] || fail "a key reused for another basket is a 422"
 
 log "waiting for the consumer to confirm (event round trip)"
 for _ in $(seq 1 30); do

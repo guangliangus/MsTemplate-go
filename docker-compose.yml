@@ -21,7 +21,7 @@
 #
 # No identity provider here, on purpose: the service validates user-svc's HS256 tokens locally.
 # Locally use the development header identities (X-Dev-Subject / X-Dev-Realm) or mint a token
-# shaped like user-svc's with tools/mint-dev-token.sh (same throwaway key as development.yaml).
+# shaped like user-svc's with tools/mint-dev-token.sh (same throwaway key as development.jsonc).
 name: msvcservice-dev
 
 services:

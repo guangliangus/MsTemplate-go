@@ -61,17 +61,6 @@ groups:
             查日志：{app="msvcservice"} |= "circuit breaker" or |= "request failed"
             常见成因：下游发布中、下游超时阈值低于它的真实延迟、base_url 配错（那是 NOT_CONFIGURED，另一种码）。
 
-      - alert: IdempotencyStoreUnavailable
-        expr: increase(msvc_http_problems_total{job=~"msvcservice-.*", error_code="IDEMPOTENCY_STORE_UNAVAILABLE"}[5m]) > 0
-        labels: { service: msvcservice, alertgroup: http, severity: critical }
-        annotations:
-          summary: "{{ $labels.job }}: 幂等存储不可达，带 Idempotency-Key 的写请求被拒绝"
-          description: |
-            Redis 不可达时幂等中间件 fail-closed：503 + Retry-After，写请求不会重复执行但也不会执行。
-            看 msvc_health_check_up{check="redis"} 与 Redis 本身；恢复后客户端按 Retry-After 重试即可，无需人工处理。
-
-  - name: msvcservice-messaging
-    rules:
       - alert: OutboxBacklogGrowing
         expr: max by (job) (msvc_messaging_outbox_pending{job=~"msvcservice-.*"}) > 100
         for: 10m
@@ -179,7 +168,7 @@ groups:
           summary: "{{ $labels.job }}: 依赖 {{ $labels.check }} 不可达"
           description: |
             gating="true"（postgres）时 pod 已经 NotReady、被摘出 Service；gating="false"（redis、rabbitmq）时
-            pod 仍然就绪、服务降级运行：缓存回源数据库，带 Idempotency-Key 的写 503，事件积压在 outbox。
+            pod 仍然就绪、服务降级运行：缓存回源数据库，事件积压在 outbox。
             这条就是共享依赖故障的主信号，readiness 刻意不为它们摘流量（docs/architecture.md 失败语义）。
             详情：admin 端口的 /health/ready 报告里每项的 description。
 

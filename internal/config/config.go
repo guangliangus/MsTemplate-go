@@ -1,5 +1,5 @@
 // Package config is the service's typed configuration: the platform sections from the kit plus
-// the service's own, bound from the embedded YAML defaults, the APP_ENV overlay and the
+// the service's own, bound from the embedded JSONC defaults, the APP_ENV overlay and the
 // environment (see the kit's conf package for the rules), and validated before anything starts.
 package config
 
@@ -29,7 +29,7 @@ import (
 	"github.com/guangliangus/go-msvc-kit/telemetry"
 )
 
-//go:embed default.yaml development.yaml
+//go:embed default.jsonc development.jsonc
 var files embed.FS
 
 // EnvVar selects the environment overlay and names the environment in logs and traces.
@@ -37,6 +37,9 @@ const EnvVar = "APP_ENV"
 
 // DefaultEnvironment applies when APP_ENV is unset.
 const DefaultEnvironment = "production"
+
+// fileExt is the configuration files' extension: JSONC (JSON plus comments), parsed by the kit.
+const fileExt = ".jsonc"
 
 // Config is the whole configuration tree.
 type Config struct {
@@ -56,7 +59,7 @@ type Config struct {
 	ServiceClients map[string]httpclient.Config `koanf:"service_clients"`
 	Orders         OrdersConfig                 `koanf:"orders"`
 
-	// Environment is APP_ENV, not a YAML key.
+	// Environment is APP_ENV, not a configuration key.
 	Environment string `koanf:"-"`
 }
 
@@ -79,13 +82,12 @@ type ServiceConfig struct {
 
 // HTTPConfig is bound from "http".
 type HTTPConfig struct {
-	ForwardedHeaders   middleware.ForwardedConfig   `koanf:"forwarded_headers"`
-	CORS               middleware.CORSConfig        `koanf:"cors"`
-	RateLimiting       middleware.RateLimitConfig   `koanf:"rate_limiting"`
-	Idempotency        middleware.IdempotencyConfig `koanf:"idempotency"`
-	RequiredHeaders    RequiredHeadersConfig        `koanf:"required_headers"`
-	ProblemTypeBaseURI string                       `koanf:"problem_type_base_uri" validate:"required"`
-	DocsEnabled        bool                         `koanf:"docs_enabled"`
+	ForwardedHeaders   middleware.ForwardedConfig `koanf:"forwarded_headers"`
+	CORS               middleware.CORSConfig      `koanf:"cors"`
+	RateLimiting       middleware.RateLimitConfig `koanf:"rate_limiting"`
+	RequiredHeaders    RequiredHeadersConfig      `koanf:"required_headers"`
+	ProblemTypeBaseURI string                     `koanf:"problem_type_base_uri" validate:"required"`
+	DocsEnabled        bool                       `koanf:"docs_enabled"`
 }
 
 // RequiredHeadersConfig is bound from "http.required_headers": the platform headers each plane's
@@ -148,7 +150,7 @@ type OrdersConfig struct {
 	PendingTimeout time.Duration `koanf:"pending_timeout" validate:"min=1m"`
 }
 
-// Load reads the environment name, the embedded YAML and the process environment.
+// Load reads the environment name, the embedded JSONC files and the process environment.
 func Load() (*Config, error) {
 	env := strings.ToLower(strings.TrimSpace(os.Getenv(EnvVar)))
 	if env == "" {
@@ -158,19 +160,19 @@ func Load() (*Config, error) {
 }
 
 func load(env string, environ func() []string) (*Config, error) {
-	defaults, err := files.ReadFile("default.yaml")
+	defaults, err := files.ReadFile("default" + fileExt)
 	if err != nil {
 		return nil, fmt.Errorf("config: embedded defaults: %w", err)
 	}
 	opts := conf.Options{Defaults: defaults, Environ: environ}
-	overlay, err := files.ReadFile(env + ".yaml")
+	overlay, err := files.ReadFile(env + fileExt)
 	switch {
 	case err == nil:
 		opts.Overlays = [][]byte{overlay}
 	case errors.Is(err, fs.ErrNotExist):
 		// an environment with no overlay runs on the defaults plus the environment variables
 	default:
-		return nil, fmt.Errorf("config: overlay %s.yaml: %w", env, err)
+		return nil, fmt.Errorf("config: overlay %s%s: %w", env, fileExt, err)
 	}
 	cfg, err := conf.Load[Config](opts)
 	if err != nil {

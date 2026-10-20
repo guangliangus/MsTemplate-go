@@ -21,3 +21,4 @@ requests.http
 .env
 .env.*
 *.local.yaml
+*.local.jsonc

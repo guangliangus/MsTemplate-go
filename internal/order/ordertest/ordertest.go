@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -18,6 +19,7 @@ import (
 	"example.com/msvcservice/internal/order"
 	"github.com/guangliangus/go-msvc-kit/apperror"
 	"github.com/guangliangus/go-msvc-kit/cache"
+	"github.com/guangliangus/go-msvc-kit/cache/cachetest"
 	"github.com/guangliangus/go-msvc-kit/messaging"
 	"github.com/guangliangus/go-msvc-kit/paging"
 )
@@ -29,14 +31,23 @@ type hooksKey struct{}
 // InTx reports whether ctx is inside a Transactor transaction.
 func InTx(ctx context.Context) bool { v, _ := ctx.Value(txKey{}).(bool); return v }
 
-// NewService wires an order.Service over the fakes, with an L1-only cache and a silent logger:
-// the one-line setup for a test that drives the service. The repository and the publisher come
-// back for assertions.
-func NewService(inv Inventory) (*order.Service, *Repo, *Publisher) {
+// NewService wires an order.Service over the fakes, with the shared cache on an in-process
+// miniredis and a silent logger: the one-line setup for a test that drives the service. The
+// repository and the publisher come back for assertions.
+func NewService(t testing.TB, inv Inventory) (*order.Service, *Repo, *Publisher) {
+	t.Helper()
 	repo, pub := NewRepo(), &Publisher{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := cache.New(cache.Config{DefaultTTL: time.Minute, LocalTTL: time.Minute, LocalMaxEntries: 10}, nil, log)
-	return order.NewService(repo, Transactor{}, inv, pub, c, log), repo, pub
+	return order.NewService(repo, Transactor{}, inv, pub, NewCache(t), log), repo, pub
+}
+
+// NewCache is the shared order cache a test hands to order.NewService: cache.Redis on an
+// in-process miniredis that lives as long as the test (cachetest), so caching and invalidation
+// behave as in production without a Redis server.
+func NewCache(t testing.TB) *cache.Redis {
+	t.Helper()
+	c, _ := cachetest.NewRedis(t)
+	return c
 }
 
 // Repo is an in-memory order.Repository: ids are issued in insert order, lists are newest first,
@@ -77,10 +88,14 @@ func (r *Repo) record(ctx context.Context, write string) {
 	}
 }
 
-// Insert implements order.Repository.
+// Insert implements order.Repository: a request id the customer already used is refused, as the
+// unique index refuses it.
 func (r *Repo) Insert(ctx context.Context, o *order.Order) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.byRequestID(o.CustomerID, o.RequestID) != nil {
+		return order.ErrDuplicateRequest
+	}
 	r.next++
 	o.ID = r.next
 	o.Version = 1
@@ -88,6 +103,31 @@ func (r *Repo) Insert(ctx context.Context, o *order.Order) error {
 	copied := *o
 	r.orders[o.ID] = &copied
 	r.record(ctx, "insert")
+	return nil
+}
+
+// FindByRequestID implements order.Repository.
+func (r *Repo) FindByRequestID(_ context.Context, customerID, requestID string) (*order.Order, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o := r.byRequestID(customerID, requestID)
+	if o == nil {
+		return nil, false, nil
+	}
+	copied := *o
+	return &copied, true, nil
+}
+
+// byRequestID is the customer's order for the request id; nil for none, and always nil for "".
+func (r *Repo) byRequestID(customerID, requestID string) *order.Order {
+	if requestID == "" {
+		return nil
+	}
+	for _, o := range r.orders {
+		if o.CustomerID == customerID && o.RequestID == requestID {
+			return o
+		}
+	}
 	return nil
 }
 

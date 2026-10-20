@@ -101,6 +101,7 @@ func TestBusinessPackageImportsNoDriverOrAdapter(t *testing.T) {
 		forbid(t, pkgs, "github.com/jackc/pgx", "no database driver in the business package")
 		forbid(t, pkgs, "github.com/rabbitmq/amqp091-go", "no broker client in the business package")
 		forbid(t, pkgs, "github.com/twmb/franz-go", "no broker client in the business package")
+		forbid(t, pkgs, "gorm.io", "no ORM in the business package: GORM is internal/postgres's detail")
 		forbid(t, pkgs, "github.com/go-chi", "no router in the business package")
 	}
 }
@@ -114,6 +115,7 @@ func TestEntryPointsUseTheService(t *testing.T) {
 			forbid(t, pkgs, internalPkg(adapter), entry+" uses the context's service, never internal/"+adapter)
 		}
 		forbid(t, pkgs, "github.com/jackc/pgx", entry+" never touches the database")
+		forbid(t, pkgs, "gorm.io", entry+" never touches the database")
 	}
 }
 

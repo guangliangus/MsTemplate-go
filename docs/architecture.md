@@ -27,13 +27,13 @@ cmd/ → internal/app ──► internal/httpapi · internal/consumers · intern
 
 | 活多久 | 怎么管 | 例子 | 怎么结束 |
 |---|---|---|---|
-| 进程 | `internal/app.build` 构造一次，经构造函数传入、存成字段 | `postgres.DB`、`redisx.Client`、`order.Service`、各 handler、`auth.Validator`、`cache.Cache` | 持有外部资源的用 `lifecycle.Closers` 登记（`closers.Add`），组件全停之后倒序关闭、每个最多等一个超时（见停机预算）；其余交给 GC |
+| 进程 | `internal/app.build` 构造一次，经构造函数传入、存成字段 | `postgres.DB`、`redisx.Client`、`order.Service`、各 handler、`auth.Validator`、`cache.Redis` | 持有外部资源的用 `lifecycle.Closers` 登记（`closers.Add`），组件全停之后倒序关闭、每个最多等一个超时（见停机预算）；其余交给 GC |
 | 后台组件 | 实现 `lifecycle.Runner`；`group.Add` 的顺序是启动顺序，反过来是停止顺序 | admin / API 监听、rabbitmq 连接与 kafka 客户端、每个 bus 的 outbox 投递器与消费者宿主、任务 runner | `group.Run` 取消它的 ctx，在预算内等它返回 |
 | 一次请求 / 消息 / 任务 | 放在 `context.Context` 上，作为每个方法的第一个参数往下传 | 事务（`db.WithTx`）、`auth.Principal`、`httpx.ErrorWriter`、`reqmeta`、`actor`、span、截止时间 | 创建它的函数返回即结束：`WithTx` 在 defer 里提交或回滚；请求结束后 ctx 不再被引用 |
 | 一次调用 | 局部变量 | 聚合、请求 / 响应类型 | GC |
 
 - 依赖**不进** ctx：`context` 包的约定是 ctx 只放跨 API 边界的请求范围数据。handler、用例服务、仓储需要什么就在构造函数里声明什么，组合根之外没有地方能"取出"一个依赖。
-- 进程级对象被所有请求并发使用，**字段里不放任何请求状态**；需要可变状态就自己加锁（`cache` 的 L1、`DevHeaders` 的 `sync.Once`）。
+- 进程级对象被所有请求并发使用，**字段里不放任何请求状态**；需要可变状态就自己加锁（kit 的 `cache.Local`、`DevHeaders` 的 `sync.Once`）。
 - ctx 上的事务不跨 goroutine：`pgx.Tx` 不是并发安全的，`WithTx` 回调拿到的 ctx 不要交给另起的 goroutine。
 - 要保留 ctx 上的值、去掉它的取消，用 `context.WithoutCancel`（任务 handler、`AfterCommit` 钩子）。
 - 没有"请求结束"的统一回调：要清理的东西由创建它的函数 `defer`；提交之后才能做的库外副作用挂 `db.AfterCommit`。
@@ -74,7 +74,7 @@ C# 模版只是参考，本模板按 Go 生态的惯例组织（标准库优先�
 
 ## 一个缺失的能力只能弄坏它自己
 
-- 每个部署都必须有的配置缺了就拒绝启动：连接串、Redis、broker 由 kit 各段的 struct tag 与 `Validate()` 管（kit 的 `conf` 在启动前校验全部 struct tag 和 `Validate()` 方法，含嵌套段）；`auth.signing_key` 由本服务的 `internal/config.Config.Validate` 要求——kit 不再对每个服务都要密钥（只有集群内路由的服务没有令牌可验），本服务验两个平面的 user-svc 令牌，所以在读配置时就拒绝，而不是等到构造 validator。`default.yaml` 是生产基线，不带任何 localhost：compose 的地址只在 `development.yaml`，production 缺 `POSTGRES__DSN` / `REDIS__ADDR` / `RABBITMQ__URL` / `AUTH__SIGNING_KEY` 之一就起不来（`config_test.go`）。
+- 每个部署都必须有的配置缺了就拒绝启动：连接串、Redis、broker 由 kit 各段的 struct tag 与 `Validate()` 管（kit 的 `conf` 在启动前校验全部 struct tag 和 `Validate()` 方法，含嵌套段）；`auth.signing_key` 由本服务的 `internal/config.Config.Validate` 要求——kit 不再对每个服务都要密钥（只有集群内路由的服务没有令牌可验），本服务验两个平面的 user-svc 令牌，所以在读配置时就拒绝，而不是等到构造 validator。`default.jsonc` 是生产基线，不带任何 localhost：compose 的地址只在 `development.jsonc`，production 缺 `POSTGRES__DSN` / `REDIS__ADDR` / `RABBITMQ__URL` / `AUTH__SIGNING_KEY` 之一就起不来（`config_test.go`）。
 - Kafka 默认关：打开后 `kafka.brokers` 必填（kit 的校验）；`kafka.events` 由本服务的 `KafkaConfig.Validate` 检查——Kafka 关着时必须为空（否则这些事件永远发不出去）、不得重复、事件名（或它在 `kafka.topics` 的覆盖）必须是合法 topic 名。
 - 只有某个能力才需要的配置（某个下游的 `base_url`）不阻止启动：`httpclient.New` 构造出一个"未配置"的客户端，第一次调用答 500 `NOT_CONFIGURED` 并在 detail 里点名缺的段。
 - 健康检查只报依赖状态：PostgreSQL 不可达时服务照样启动、readiness 报不健康（不要 CrashLoop，等它回来）。
@@ -84,7 +84,7 @@ C# 模版只是参考，本模板按 Go 生态的惯例组织（标准库优先�
 ## 两个监听端口
 
 - `server.addr`（8080）只有 API；`server.admin_addr`（8081）只有三个探针和 `/metrics`。Ingress 只指向 API 端口，所以探针与指标永远不会经它暴露；API 被打满时探针也不受影响。worker 没有 API 监听，只起 admin。
-- admin 的 handler 是 kit 的 `httpserver.AdminHandler(registry, metrics)`：一个裸 `http.ServeMux`，不套任何中间件（kubelet 每几秒探一次，日志、span、认证都是噪声），GET 以外一律 405。API 监听上的 `/docs/`（Scalar 页面）与 `/docs/openapi.yaml`（文档本身）是 kit 的 `httpx.Docs`，挂在中间件链外面，只在 `http.docs_enabled` **且** `APP_ENV=development` 时存在。
+- admin 的 handler 是 kit 的 `httpserver.AdminHandler(registry, metrics)`：一个裸 `http.ServeMux`，不套任何中间件（kubelet 每几秒探一次，日志、span、认证都是噪声），GET 以外一律 405。API 监听上的 `/docs/`（Swagger UI 页面）与 `/docs/openapi.yaml`（文档本身）是 kit 的 `httpx.Docs`，挂在中间件链外面，只在 `http.docs_enabled` **且** `APP_ENV=development` 时存在。
 - 生命周期里 admin 最先注册、最后停止：排空期间 readiness 一直答 503，指标一直可抓。chart 的探针与 ServiceMonitor 都指向 `admin` 端口。
 
 ## 停机预算
@@ -102,11 +102,14 @@ K8s 的 `terminationGracePeriodSeconds` 从 preStop **之前**开始计时，所
 
 - kit 自己的表随 kit 发版：`db/kit_0001_messaging.sql` 的 `outbox_messages` 有 `next_attempt_at`（被 broker 拒收后按指数退避推后的最早重投时间，`outbox.retry_base_delay` → `retry_max_delay`）、`partition_key`（事件的分区键，Kafka 的 record key，空串 = 无键）和部分索引 `(next_attempt_at, id) WHERE status = 'PENDING'`。早于这一版建的本地库光重跑脚本补不上——`CREATE TABLE IF NOT EXISTS` 不加列，新列的 `COMMENT ON COLUMN` 因此失败，`CREATE INDEX IF NOT EXISTS` 看到同名旧索引就跳过——要么 `make down && make up` 重建，要么执行 `db/README.md` 里的两句 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`（`next_attempt_at`、`partition_key`）加 `DROP INDEX` 再重跑脚本。
 
-- 事务随 `context` 传递：仓储方法一律从 `db.Q(ctx)` 取执行器，于是 `db.WithTx(ctx, fn)` 里面的所有写（业务行、outbox 行、任务行）同一个事务提交。嵌套 `WithTx` 加入外层事务。
+- 事务随 `context` 传递：`db.WithTx(ctx, fn)` 开一个 `*sql.Tx`（kit 的事务层基于 `database/sql`，底下是同一个 pgx 连接池）挂到 ctx 上；kit 自己的 outbox / inbox / 任务队列从 `db.Q(ctx)` 取执行器，服务的 GORM 仓储从 `Gorm.On(ctx)` 取会话（把 GORM 的 `ConnPool` 设成这个 `*sql.Tx`），于是业务行、outbox 行、任务行同一个事务提交。嵌套 `WithTx` 加入外层事务。ctx 在事务中途被取消时 `database/sql` 会回滚整个事务。
 - 库外的副作用（删缓存）用 `db.AfterCommit(ctx, fn)` 挂到**最外层事务提交之后**，回滚则不执行，不在事务里则立即执行。提交前删缓存会让并发读把旧行重新写回缓存，一个 TTL 内都是旧值。用例服务通过 `Transactor` 端口拿到它。
+- 缓存按数据的一致性要求选，两种不叠成两级：会被写改动、改了就要处处生效的数据（订单）用共享的 `cache.NewRedis`，`Remove` 对每个副本立即生效；**本来就允许旧 N 秒**的数据（类目、配置、开关）才用 `cache.NewLocal[T]`，它每个 pod 一份、只靠自己的 TTL 过期、没有 `Remove`，TTL 写在缓存它的代码旁边。真有热点 key 需要两级，在调用处把本地缓存套在共享缓存外面，让"这类读可能旧多久"写在接受它的地方（known-open #13）。
+- 共享缓存的用法按手里有什么来选：一个 key 用 `cache.GetOrCreate`；一批 id（列表页）用 `cache.GetOrCreateMany`，一次往返读、一次查询补缺，不要循环调单个；源数据变了一律 `Remove`（多个 key 一次传进去），不要用 `Set` 写新值——两个写者提交后的 `Set` 到达顺序不定，会把旧值留一整个 TTL。`Set` / `SetMany` 只给"唯一写者发布刚算出来的值"（比如定时任务）。`Remove` 留一个 `load_timeout + 1s` 的墓碑、回填一律 `SET NX`，所以"提交前读到旧行、失效后才回填"的读者写不回旧值；代价是失效后这几秒该 key 不缓存。
 - 每个会话设 `idle_in_transaction_session_timeout`（`postgres.idle_in_transaction_timeout`，默认 60s）兜底：事务里不许等任何慢东西（broker、下游），真等了由数据库结束它，而不是一直占着行锁和 vacuum 视界。
 - `WithTxRetry` 只在序列化失败/死锁（40001/40P01）时**整段重跑**，里面的工作必须可重复。
-- 乐观并发用 `xmin`：仓储 `UPDATE ... WHERE id = $1 AND xmin = $4`，零行即 409 `CONCURRENCY_CONFLICT`。零 schema 成本。
+- 数据访问用 GORM：`postgres.OpenGorm` 开在 kit 的 `db.SQL()` 上（`SkipDefaultTransaction`、`QueryFields`、`DisableAutomaticPing`、UTC 的 `NowFunc`；日志交给 kit 的 pgx tracer，GORM 自己的 logger 关掉），只有 `internal/postgres` 能 import GORM（depguard 的 `gorm-stays-in-the-adapter` 与架构测试）。模型是 `db/*.sql` 的映射、永不 AutoMigrate；列名或映射写错到集成测试（Testcontainers 用 `db/*.sql` 建库）才暴露（known-open #8）。审计列由模型钩子从 `actor.FromContext` 写；GORM 构造器表达不好的语句（`FOR UPDATE SKIP LOCKED` 子查询）用 `Raw`，Raw 不经钩子与插件，要自己写审计列与版本自增。
+- 乐观并发用显式 `version` 列加 GORM 的 `optimisticlock` 插件：经模型 API 的更新自动带 `WHERE version = ?` 与 `SET version = version + 1`，零行即 409 `CONCURRENCY_CONFLICT`。插件对版本号为 0 的对象不加条件，仓储因此拒绝"没加载版本号"的更新；Raw 的 UPDATE 自己自增。两条都有集成测试。
 - 审计列由仓储显式写，操作人来自 `actor.FromContext(ctx)`：HTTP = token 的 `sub`/`client_id`，消费者与后台任务 = `system`。
 - 慢 SQL 日志只记语句不记实参（`postgres.slow_query_threshold`，每秒限速 `slow_query_log_rate`，被限速的仍计入 `msvc_db_slow_queries_total{logged="false"}`）。elapsed 不含等连接的时间，排队看 `pgxpool_empty_acquire_total`；池的 `pgxpool_*` 指标在 `postgres.Open` 里注册。
 
@@ -129,7 +132,7 @@ K8s 的 `terminationGracePeriodSeconds` 从 preStop **之前**开始计时，所
 1. `ClientIPResolver` 第一个——它决定后面所有人看到的客户端地址；`PlatformHeaders` 紧随其后，之后任何调下游的代码都能透传平台头。
 2. `otelhttp` 在请求日志**外面**——日志行要带 trace_id。
 3. `RequestLogger` 在 `Recoverer` **外面**——它记录客户端真正收到的状态，被处理成 400 的校验失败绝不能记成 500，否则基于请求日志的 SLO 看板会把自己的 4xx 读成自己的宕机。
-4. `Authenticate` 在限流之前（按调用方分桶）、两者都在 `Idempotency` 之前（key 按调用方隔离，重放也要占预算）。
+4. `Authenticate` 在限流之前（按调用方分桶）。幂等不在这条链上：什么算重复由各上下文自己判断，记录在自己的表里（见下面「幂等由业务在数据库里做」）。
 
 ## 请求超时为什么可以放在应用里
 
@@ -141,9 +144,22 @@ K8s 的 `terminationGracePeriodSeconds` 从 preStop **之前**开始计时，所
 
 kit 的 `resilience` 和 `httpclient` 能替你分类哪些失败是瞬态的，**分不清你的操作能不能重复执行**。超时之后没有任何谓词知道第一次尝试是否已经提交。所以：
 
-- 读操作、`ON CONFLICT DO NOTHING`、带 `Idempotency-Key` 的写——可以重试。HTTP 客户端只自动重试幂等方法（GET/HEAD/OPTIONS/PUT/DELETE）或带 `Idempotency-Key` 的请求。
+- 读操作、`ON CONFLICT DO NOTHING`、服务端按 `Idempotency-Key` 去重的写（如下单）——可以重试。HTTP 客户端只自动重试幂等方法（GET/HEAD/OPTIONS/PUT/DELETE）或带 `Idempotency-Key` 的请求。
 - 裸 INSERT、扣款、发消息——不要放进重试，或者先给它一个幂等键。
 - 熔断器**默认只架在单个下游前面**（`service_clients.*.breaker`）；共享资源（数据库、Redis）前不放熔断器——一个病态调用方打开它就拒掉所有不相干调用。
+
+## 幂等由业务在数据库里做
+
+没有通用的 HTTP 幂等中间件。按「调用方 + 路径 + key」在 Redis 里快照响应的做法已经从 kit 删掉，原因有三：什么算重复只有业务知道（中间件不看请求体，同一个 key 换了内容也会重放第一次的结果）；去重记录和业务数据不在一个事务里（数据库提交后、写 Redis 前崩溃，客户端重试会再执行一次）；响应快照要和缓存共用 Redis 的容量与淘汰策略（被 LRU 淘汰时保证静默消失）。消息消费早就是这么做的：inbox 是数据库里的一张表，和 handler 的写同一事务。
+
+需要幂等的写由那个上下文自己做，下单是参考写法（`order.Service.Create`）：
+
+- 客户端在 `Idempotency-Key` 头里给请求 id（头名沿用 IETF 草案；kit 的 `httpclient` 也只重试带这个头的非幂等请求）。handler 只管形状（≤ 128 字符，否则 400），含义归上下文。
+- 请求 id 存进业务行（`orders.request_id`），`(customer_id, request_id)` 上有部分唯一索引（`db/0003_orders_request_id.sql`）。它和订单行、outbox 行同一事务提交，所以保证跨副本、跨重启都成立，也不会过期。
+- 重复请求先查：查到了、商品也相同，答 200 和那张订单的当前状态（取消了就是取消），不再询价、不再写、不再发事件。同一个 id 换了商品是 422 `ORDER_REQUEST_ID_REUSED`，而不是把别的订单当成功答回去。
+- 两个重复请求同时越过了查询：后插入的那个在唯一索引上等前一个事务结束，被拒（仓储译成 `order.ErrDuplicateRequest`，自己的事务连同事件一起回滚），然后读出前一个的订单作答。集成测试并发地验证"一次请求、一张订单、一个事件"。
+
+别的上下文照这个形状做：请求 id 列 + 唯一约束 + 在同一事务里写，重复时按业务规则答复。天然幂等的写（按 id 改状态、`ON CONFLICT DO NOTHING`）不需要请求 id。
 
 ## 失败语义：判断标准是「降级后回落到什么」
 
@@ -153,8 +169,7 @@ kit 的 `resilience` 和 `httpclient` 能替你分类哪些失败是瞬态的，
 |---|---|---|
 | PostgreSQL | fail-closed，`/health/ready` 报不健康（gating：pod 被摘出 Service） | 没有库就给不出正确答案 |
 | Redis（整体） | readiness 只报告不摘流量（informational），`DependencyUnavailable` 告警 | 所有副本同时受影响，摘流量只会把降级变成全量 503；下面两行各自决定降级方式 |
-| Redis · HTTP 幂等键 | fail-closed，503 `IDEMPOTENCY_STORE_UNAVAILABLE` + Retry-After | 幂等键底下没有兜底：存储不可达时放行等于把"绝不能重复"的写静默变成可重复 |
-| Redis · 缓存 | fail-open，回源并记 warn | 数据库仍然是真相 |
+| Redis · 缓存 | fail-open，回源并记 warn；订单缓存没有本地一层，Redis 不可达时订单读全部回源（known-open #13） | 数据库仍然是真相 |
 | Redis · 业务限流（`FixedWindowAllow`） | 返回 allow + error，调用方 fail-open | 它保护的端点仍会被认证、校验、审计；抖动期间全拒会让限流器亲手造成它要防的那次故障 |
 | RabbitMQ 不可达 | readiness 只报告不摘流量；投递器不认领行（不开事务、不锁行、不花 attempts），outbox 行堆积为 PENDING，积压指标照常采样（`msvc_messaging_outbox_oldest_pending_age_seconds` 会涨、会告警）；消费者自动重连 | 事件永不丢，只是晚到。只有 broker 拒收这条消息本身才计 attempts，满了停成 FAILED |
 | Kafka 不可达 | readiness 只报告不摘流量（informational，客户端每 `kafka.ping_interval` 探一次）；Kafka 的投递器不认领 `kafka.events` 的行，它们堆积为 PENDING（积压指标照常、会告警），超时与连不上不花 attempts；RabbitMQ 的投递器只认领自己的事件，照常投递；消费者由客户端自己重连，回来后从已提交的 offset 接着消费（只提交已处理或已转到重试 / 死信 topic 的 record） | 与 RabbitMQ 同理，事件永不丢、只是晚到；每个 bus 一个投递器，一个 broker 宕掉不拖住另一个的事件 |

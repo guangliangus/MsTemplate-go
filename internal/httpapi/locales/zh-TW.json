@@ -4,5 +4,6 @@
   "ORDER_ITEM_UNAVAILABLE": "商品庫存不足",
   "ORDER_NOT_PENDING": "訂單狀態已變更",
   "ORDER_NOT_CANCELLABLE": "此訂單無法取消",
-  "ORDER_TOTAL_TOO_LARGE": "訂單金額超出上限，請拆成多筆訂單"
+  "ORDER_TOTAL_TOO_LARGE": "訂單金額超出上限，請拆成多筆訂單",
+  "ORDER_REQUEST_ID_REUSED": "此請求識別碼已用於另一筆訂單"
 }

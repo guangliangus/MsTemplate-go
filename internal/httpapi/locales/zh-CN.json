@@ -4,5 +4,6 @@
   "ORDER_ITEM_UNAVAILABLE": "商品库存不足",
   "ORDER_NOT_PENDING": "订单状态已变更",
   "ORDER_NOT_CANCELLABLE": "该订单无法取消",
-  "ORDER_TOTAL_TOO_LARGE": "订单金额超出上限，请拆分为多个订单"
+  "ORDER_TOTAL_TOO_LARGE": "订单金额超出上限，请拆分为多个订单",
+  "ORDER_REQUEST_ID_REUSED": "该请求标识已用于另一笔订单"
 }

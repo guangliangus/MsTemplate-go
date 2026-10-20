@@ -19,9 +19,9 @@ import (
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func TestHandleConfirmsTheOrderAndTolerantsRedelivery(t *testing.T) {
-	svc, repo, _ := ordertest.NewService(ordertest.Inventory{UnitPrice: decimal.NewFromInt(1)})
+	svc, repo, _ := ordertest.NewService(t, ordertest.Inventory{UnitPrice: decimal.NewFromInt(1)})
 	ctx := context.Background()
-	o, err := svc.Create(ctx, "c1", []order.Line{{SKU: "A", Quantity: 1}})
+	o, _, err := svc.Create(ctx, "c1", "", []order.Line{{SKU: "A", Quantity: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestHandleConfirmsTheOrderAndTolerantsRedelivery(t *testing.T) {
 // straight to the dead-letter queue as non_retryable, not climb the retry ladder and fire the
 // `exhausted` alert for something that is not an outage.
 func TestHandleGivesUpOnAnUnknownOrder(t *testing.T) {
-	svc, _, _ := ordertest.NewService(ordertest.Inventory{})
+	svc, _, _ := ordertest.NewService(t, ordertest.Inventory{})
 	h := consumers.NewOrderCreatedHandler(svc, quiet)
 	err := h.Handle(context.Background(), messaging.Message[order.CreatedEvent]{Body: order.CreatedEvent{OrderID: 404}})
 	if !errors.Is(err, messaging.ErrNonRetryable) {

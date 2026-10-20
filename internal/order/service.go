@@ -2,6 +2,7 @@ package order
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -37,31 +38,47 @@ type Service struct {
 	tx        Transactor
 	inventory InventoryClient
 	publisher messaging.Publisher
-	cache     *cache.Cache
+	cache     *cache.Redis
 	log       *slog.Logger
 }
 
 // NewService wires the service.
 func NewService(repo Repository, tx Transactor, inventory InventoryClient, publisher messaging.Publisher,
-	c *cache.Cache, log *slog.Logger) *Service {
+	c *cache.Redis, log *slog.Logger) *Service {
 	return &Service{repo: repo, tx: tx, inventory: inventory, publisher: publisher, cache: c, log: log}
 }
 
 // Create checks the lines, prices every one with the inventory service (which also says whether it
 // can be sold) and commits the order and its CreatedEvent together. The line rules run once, before
 // any downstream call; newChecked then adds only what the prices can tell.
-func (s *Service) Create(ctx context.Context, customerID string, lines []Line) (*Order, error) {
+//
+// requestID (the client's Idempotency-Key, "" for none) makes the call idempotent for the customer:
+// a repeated request is answered with the order the first one created and created=false, and
+// nothing is priced, written or published again. What counts as a repeat is this business's call —
+// the same customer, the same request id and the same lines; the id reused for another basket is a
+// 422 ORDER_REQUEST_ID_REUSED, never another basket's order. The guarantee is the database's: a
+// unique index on (customer_id, request_id) commits with the order and its event, so it holds
+// across replicas and restarts, and a repeat racing the first request waits for it at the index.
+func (s *Service) Create(ctx context.Context, customerID, requestID string, lines []Line,
+) (o *Order, created bool, err error) {
 	if err := CheckLines(customerID, lines); err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if prior, found, err := s.priorOrder(ctx, customerID, requestID); err != nil || found {
+		if err != nil {
+			return nil, false, err
+		}
+		return answerRepeat(prior, lines)
 	}
 	items, err := s.price(ctx, lines)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	o, err := newChecked(customerID, items)
+	o, err = newChecked(customerID, items)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	o.RequestID = requestID
 
 	// One transaction: the order rows and the outbox row commit together, or not at all.
 	err = s.tx.WithTx(ctx, func(ctx context.Context) error {
@@ -71,11 +88,39 @@ func (s *Service) Create(ctx context.Context, customerID string, lines []Line) (
 		event := CreatedEvent{OrderID: o.ID, CustomerID: o.CustomerID, TotalAmount: money.From(o.TotalAmount)}
 		return s.publisher.Publish(ctx, event)
 	})
+	if errors.Is(err, ErrDuplicateRequest) {
+		// A repeat of this request committed between the lookup above and this insert; the unique
+		// index refused this one, and the rollback took its event with it. Answer with the winner's.
+		prior, found, lookupErr := s.priorOrder(ctx, customerID, requestID)
+		if lookupErr != nil || !found {
+			return nil, false, errors.Join(err, lookupErr)
+		}
+		return answerRepeat(prior, lines)
+	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	s.log.InfoContext(ctx, "order created", slog.Int("order_id", o.ID), slog.String("customer_id", o.CustomerID))
-	return o, nil
+	return o, true, nil
+}
+
+// priorOrder finds the order an earlier request with this id created; a request without an id has
+// none.
+func (s *Service) priorOrder(ctx context.Context, customerID, requestID string) (*Order, bool, error) {
+	if requestID == "" {
+		return nil, false, nil
+	}
+	return s.repo.FindByRequestID(ctx, customerID, requestID)
+}
+
+// answerRepeat answers a repeated request with the order the first one created, as it stands now
+// (a cancelled order stays cancelled) — provided the repeat asks for the same lines.
+func answerRepeat(prior *Order, lines []Line) (*Order, bool, error) {
+	if !prior.createdFrom(lines) {
+		return nil, false, apperror.DomainRule(CodeRequestIDReused,
+			"This Idempotency-Key was already used for a different order; send a new key for a new order.")
+	}
+	return prior, false, nil
 }
 
 // price quotes every line concurrently (at most maxConcurrentQuotes at once) and turns the answers
@@ -105,7 +150,9 @@ func (s *Service) price(ctx context.Context, lines []Line) ([]Item, error) {
 	return items, nil
 }
 
-// Get returns one order through the two-level cache; customerID scopes the lookup ("" = any).
+// Get returns one order through the shared (Redis) cache: an order changes on writes, so every
+// replica must see its invalidation at once, which a per-pod copy could not. customerID scopes the
+// lookup ("" = any).
 func (s *Service) Get(ctx context.Context, id int, customerID string) (*Order, error) {
 	o, err := cache.GetOrCreate(ctx, s.cache, cacheKey(id), 0, func(ctx context.Context) (Order, error) {
 		stored, err := s.repo.Get(ctx, id, "")
@@ -189,9 +236,7 @@ func (s *Service) ReapPending(ctx context.Context, timeout time.Duration) (int64
 		if err != nil {
 			return total, err
 		}
-		for _, id := range ids {
-			s.invalidateAfterCommit(ctx, id)
-		}
+		s.invalidateAfterCommit(ctx, ids...)
 		total += int64(len(ids))
 		if len(ids) < reapBatchSize {
 			break
@@ -200,16 +245,25 @@ func (s *Service) ReapPending(ctx context.Context, timeout time.Duration) (int64
 	return total, nil
 }
 
-// invalidateAfterCommit drops the cached order once the change is committed. Dropping it before
-// the commit lets a concurrent reader load the old row and cache it again for a whole TTL.
-func (s *Service) invalidateAfterCommit(ctx context.Context, id int) {
-	s.tx.AfterCommit(ctx, func(ctx context.Context) { s.invalidate(ctx, id) })
+// invalidateAfterCommit drops the cached orders once the change is committed, all of them in one
+// pipelined round trip. Dropping them before the commit lets a concurrent reader load the old row
+// and cache it again for a whole TTL; dropping them after it is safe even against a reader that
+// read the old row before the commit (the cache's Remove keeps that late write out).
+func (s *Service) invalidateAfterCommit(ctx context.Context, ids ...int) {
+	if len(ids) == 0 {
+		return
+	}
+	s.tx.AfterCommit(ctx, func(ctx context.Context) { s.invalidate(ctx, ids) })
 }
 
-func (s *Service) invalidate(ctx context.Context, id int) {
-	if err := s.cache.Remove(ctx, cacheKey(id)); err != nil {
+func (s *Service) invalidate(ctx context.Context, ids []int) {
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = cacheKey(id)
+	}
+	if err := s.cache.Remove(ctx, keys...); err != nil {
 		s.log.WarnContext(ctx, "order cache invalidation failed; stale reads possible until the TTL",
-			slog.Int("order_id", id), slog.Any("error", err))
+			slog.Any("order_ids", ids), slog.Any("error", err))
 	}
 }
 

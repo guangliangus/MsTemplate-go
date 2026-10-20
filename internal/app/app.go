@@ -128,7 +128,6 @@ func Run(ctx context.Context, mode Mode, version string, openAPI []byte) error {
 			ErrorWriter: deps.errorWriter,
 			Auth:        deps.authValidator,
 			DevHeaders:  deps.devHeaders,
-			Idempotency: redisx.NewIdempotencyStore(deps.rdb),
 			Orders:      deps.orders,
 			OpenAPI:     openAPI,
 		})
@@ -203,12 +202,18 @@ func build(ctx context.Context, cfg *config.Config, mode Mode, log *slog.Logger)
 	if err != nil {
 		return nil, err
 	}
+	// GORM runs on the kit's pool and joins the kit's transactions (postgres.Gorm.On); it opens no
+	// connection of its own, so there is nothing of it to close.
+	gormDB, err := postgres.OpenGorm(db)
+	if err != nil {
+		return nil, err
+	}
 	d.orders = order.NewService(
-		postgres.NewOrderRepository(db),
+		postgres.NewOrderRepository(gormDB),
 		db,
 		inventory.New(inventoryHTTP),
 		messaging.NewOutboxPublisher(db),
-		cache.New(cfg.Cache, rdb, log),
+		cache.NewRedis(cfg.Cache, rdb, log),
 		log,
 	)
 	return d, nil
@@ -220,7 +225,7 @@ func (d *dependencies) registerTasks(cfg *config.Config, group *lifecycle.Group,
 	store := taskqueue.NewStore(d.db)
 	runner := taskqueue.NewRunner(store, cfg.Tasks, log)
 	// The interval here is only the fallback: tasks.recurring.pending-orders-reaper in the
-	// configuration overrides it (default.yaml sets it), so change it there, not here.
+	// configuration overrides it (default.jsonc sets it), so change it there, not here.
 	must(runner.Recurring("pending-orders-reaper", time.Minute,
 		tasks.NewPendingOrdersReaper(d.orders, cfg.Orders.PendingTimeout, log)))
 	must(runner.Cron("heartbeat", "0 */5 * * * *", tasks.NewHeartbeat(log)))

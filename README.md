@@ -2,7 +2,7 @@
 
 一个**可直接运行**的参考服务，同时就是模板：`tools/new-service.sh` 复制并改名即得到新服务。基础设施开箱即用，开发者只写业务代码。按 Go 生态的惯例组织（标准库优先、`net/http` 中间件、按限界上下文分包、接口定义在使用方、组合根显式装配），只在**平台互通契约**上与平台现有服务（含 C# 服务与 user-svc）保持一致：错误契约（`errorCode` / `traceId` / `urn:msvc:error:`）、消息线格式（AMQP 头、队列命名；Kafka 的 topic、key、头、consumer group）、指标名、令牌格式。契约清单见 `docs/architecture.md`。
 
-- **技术栈**：Go 1.26+ · chi v5（纯 `net/http`）· PostgreSQL + pgx v5（原生 SQL，无 ORM）· Redis + go-redis v9 · RabbitMQ 官方 amqp091-go · Kafka franz-go（可选，按事件与 RabbitMQ 并存）· OpenTelemetry（traces OTLP 推送 / metrics Prometheus 抓取）· `log/slog` JSON 日志 · koanf 配置（内嵌 YAML 默认值 + `SECTION__KEY` 环境变量）· golang-jwt v5 HS256（user-svc 签发的令牌本地验签）· gobreaker 熔断 · 数据库任务队列（间隔 + cron + misfire 策略）· Testcontainers 集成测试
+- **技术栈**：Go 1.26+ · chi v5（纯 `net/http`）· PostgreSQL + pgx v5 + GORM（跑在 kit 的连接池与事务上，不做迁移）· Redis + go-redis v9 · RabbitMQ 官方 amqp091-go · Kafka franz-go（可选，按事件与 RabbitMQ 并存）· OpenTelemetry（traces OTLP 推送 / metrics Prometheus 抓取）· `log/slog` JSON 日志 · koanf 配置（内嵌 JSONC 默认值 + `SECTION__KEY` 环境变量）· golang-jwt v5 HS256（user-svc 签发的令牌本地验签）· gobreaker 熔断 · 数据库任务队列（间隔 + cron + misfire 策略）· Testcontainers 集成测试
 - **交付物**：一个二进制、两种形态（`serve` / `worker`，同一镜像）· 平台基础包 kit（独立的私有 Go 模块 `github.com/guangliangus/go-msvc-kit`，按版本依赖）· Orders 端到端示例 · docker-compose 全家桶 · Helm Chart · Azure Pipelines · 生成脚本
 
 ## 仓库结构
@@ -11,16 +11,16 @@
 cmd/msvcservice/           main：serve | worker | version
 internal/
   app/                     组合根：读配置、显式装配、注册生命周期组件（没有 DI 容器）；messaging.go 按事件把 outbox 与订阅分给 RabbitMQ / Kafka
-  config/                  类型化配置 + 内嵌 default.yaml / development.yaml
+  config/                  类型化配置 + 内嵌 default.jsonc / development.jsonc
   order/                   示例限界上下文：聚合（不变量、状态机、错误码）+ 用例服务 + 端口接口 + 集成事件
     ordertest/             端口的内存假实现 + NewService 一行装配；handler / consumer / task 的测试共用
-  postgres/                order 端口的仓储实现（原生 SQL、ctx 事务、xmin 乐观并发、审计列）
+  postgres/                order 端口的仓储实现（GORM 模型映射手写的 DDL、Gorm.On(ctx) 加入 ctx 事务、version 乐观并发、钩子写审计列）
   inventory/               下游库存服务的 HTTP 适配器（实现 order 的端口，走弹性客户端）
   httpapi/                 路由（中间件顺序）、handler、请求/响应类型、错误文案目录、路由↔OpenAPI 守卫；/docs 挂 kit 的 httpx.Docs（只在开发环境）
   consumers/               事件消费者（inbox 事务内运行）
   tasks/                   后台任务（recurring + cron 示例）
 db/                        手写幂等 DDL（schema 唯一真相，应用永不改库）；kit_*.sql 是 kit 的表的副本
-api/openapi.yaml           手写 OpenAPI 3.1，开发环境在 /docs 以 Scalar 渲染
+api/openapi.yaml           手写 OpenAPI 3.1，开发环境在 /docs 以 Swagger UI 渲染
 deploy/helm/msvcservice/   Helm Chart（api + worker 两个 Deployment、HPA/PDB/KEDA/ServiceMonitor/Ingress/NetworkPolicy）
 deploy/grafana/            看板 JSON、告警规则（含路由标签与 runbook）、导入脚本；compose 与集群共用这一份
 deploy/compose/            本地栈的 Prometheus / Grafana provisioning、WireMock 库存桩
@@ -76,7 +76,7 @@ docker compose --profile kafka up -d
 KAFKA__ENABLED=true KAFKA__EVENTS=orders.order-created.v1 make run   # 这个事件改走 Kafka（outbox → topic → consumer group → CONFIRMED），它的 RabbitMQ 队列不再声明
 ```
 
-`tools/e2e.sh` 覆盖（与脚本头部的清单同一份）：admin 端口的探针与 /metrics（API 端口上没有）→ 铸一个 user-svc 形状的令牌 → 401 / 403 / 伪造密钥 401 → 创建订单 → outbox → RabbitMQ → 消费者确认 → 400 / 422 错误契约 → 幂等重放 → 限流 429 → 熔断（WireMock `FAULT` SKU，502）→ **重启 RabbitMQ 自动重连**再走一单。它只走 RabbitMQ 路径；Kafka 上的发布、消费、重试与死信 topic 由 kit 的 `tests/integration/kafka_test.go` 对真 broker 覆盖。
+`tools/e2e.sh` 覆盖（与脚本头部的清单同一份）：admin 端口的探针与 /metrics（API 端口上没有）→ 铸一个 user-svc 形状的令牌 → 401 / 403 / 伪造密钥 401 → 创建订单 → outbox → RabbitMQ → 消费者确认 → 400 / 422 错误契约 → 幂等下单（同一个 key：200、同一张订单；换了商品：422）→ 限流 429 → 熔断（WireMock `FAULT` SKU，502）→ **重启 RabbitMQ 自动重连**再走一单。它只走 RabbitMQ 路径；Kafka 上的发布、消费、重试与死信 topic 由 kit 的 `tests/integration/kafka_test.go` 对真 broker 覆盖。
 
 控制台：RabbitMQ `:15672`（guest/guest）· Prometheus `:9090` · Grafana `:3000`（admin/admin，预置 RED/消息/任务看板）· Jaeger `:16686` · WireMock `:8089`。
 
@@ -97,7 +97,7 @@ deploy/kind/kind-smoke.sh   # K8s 冒烟：kind + 依赖 + db/*.sql + helm insta
 0. 配好 kit 的私有模块访问（上面的"平台 kit"：`GOPRIVATE` + `gh auth setup-git`，每台机器一次）——生成脚本要 `go mod tidy`，拉不到 kit 就停在那一步。
 1. `tools/new-service.sh payment github.com/acme/payment` 并推到新仓库。
 2. 建库：为服务申请独立数据库；`POSTGRES__DSN` 走 K8s Secret。
-3. 写领域模型（参考 `internal/order` 的注释），手写 `db/0001_init.sql`（团队规范：`text`、`TIMESTAMPTZ`、`SERIAL`、复数表名、软状态，守卫会检查）并交 DBA 执行；仓储放 `internal/postgres`，用 `db.Q(ctx)` 取执行器以加入事务。
+3. 写领域模型（参考 `internal/order` 的注释），手写 `db/0001_init.sql`（团队规范：`text`、`TIMESTAMPTZ`、`SERIAL`、复数表名、软状态，守卫会检查）并交 DBA 执行；仓储放 `internal/postgres`：GORM 模型映射你的表（`TableName()`，不调 AutoMigrate），一律经 `r.gorm.On(ctx)` 取会话以加入 ctx 上的事务；有乐观并发的表加 `version` 列并用 `optimisticlock.Version` 字段，Raw SQL 的 UPDATE 要自己 `version = version + 1`。
 4. 定义集成事件（`EventName()` 显式带版本，只带业务键；要按聚合保序的实现 `messaging.Keyed`）与消费者（`messaging.Subscribe` 自动套 inbox）；事件在哪个 bus 上由 `kafka.events` 决定（平台决策，见决策记录）；定时/后台任务实现 `taskqueue.Handler` 挂到 runner。
 5. 删掉 orders 示例：按 `docs/replacing-the-example.md` 逐项清（先加后删，`make test` 一路绿；留意 KEDA `queueName`（Kafka trigger 是 `kafka.consumerGroup` / `kafka.topic`）与 `tests/arch/deps_test.go` 顶部的表这两个编译器发现不了的地方），最后跑 `tools/check-example-removed.sh`，退出码 0 才算删干净。
 6. `make up` + `make run`；`requests.http` 走一遍；写 handler 测试（参考 `internal/httpapi/router_test.go`，无需容器）。
@@ -106,14 +106,14 @@ deploy/kind/kind-smoke.sh   # K8s 冒烟：kind + 依赖 + db/*.sql + helm insta
 
 ## 配置
 
-`internal/config/default.yaml` 是每个部署的起点（每个键都有注释），也是**生产基线**：不带任何 localhost 连接串，compose 的地址只在 `development.yaml` 里；`APP_ENV` 不设即 production，没有 `POSTGRES__DSN` / `REDIS__ADDR` / `RABBITMQ__URL` / `AUTH__SIGNING_KEY` 就拒绝启动（`config_test.go` 证明这一点）。`APP_ENV` 选 overlay（`development.yaml`），环境变量 `SECTION__KEY` 覆盖任意键（列表用逗号：`RABBITMQ__RETRY_DELAYS=30s,2m,10m`；map 键是路径的一段：`TASKS__RECURRING__HEARTBEAT=5m`）。没有 `__` 的环境变量永远不会进入配置。所有段在启动前校验（struct tag + `Validate()`，含跨字段规则如 `task_timeout < stale_after`），配错 fail-fast。
+`internal/config/default.jsonc` 是每个部署的起点（JSONC：JSON 加 `//` 注释，每个键都有注释；时长写成字符串 `"30s"`；同一文件里重复的键启动即报错），也是**生产基线**：不带任何 localhost 连接串，compose 的地址只在 `development.jsonc` 里；`APP_ENV` 不设即 production，没有 `POSTGRES__DSN` / `REDIS__ADDR` / `RABBITMQ__URL` / `AUTH__SIGNING_KEY` 就拒绝启动（`config_test.go` 证明这一点）。`APP_ENV` 选 overlay（`development.jsonc`），环境变量 `SECTION__KEY` 覆盖任意键（列表用逗号：`RABBITMQ__RETRY_DELAYS=30s,2m,10m`；map 键是路径的一段：`TASKS__RECURRING__HEARTBEAT=5m`）。没有 `__` 的环境变量永远不会进入配置。所有段在启动前校验（struct tag + `Validate()`，含跨字段规则如 `task_timeout < stale_after`），配错 fail-fast。
 
 | 段 | 要点 |
 |---|---|
 | `server` | `addr`（API）与 `admin_addr`（探针 + /metrics）两个监听、各超时、`shutdown_timeout`（总停机预算）与 `drain_timeout`（API 排空份额，须小于前者）、`request_timeout`（→ 504）、`max_body_bytes`、`max_header_bytes`（0 = net/http 默认） |
-| `http` | `forwarded_headers`（chart 打开；`trusted_proxies` CIDR）、`cors`、`rate_limiting`（per-pod！）、`idempotency`、`required_headers.consumer / backoffice`（缺则 400 MISSING_HEADERS）、`problem_type_base_uri`、`docs_enabled`（只在 `APP_ENV=development` 生效，代码里写死） |
+| `http` | `forwarded_headers`（chart 打开；`trusted_proxies` CIDR）、`cors`、`rate_limiting`（per-pod！）、`required_headers.consumer / backoffice`（缺则 400 MISSING_HEADERS）、`problem_type_base_uri`、`docs_enabled`（只在 `APP_ENV=development` 生效，代码里写死） |
 | `logging` / `telemetry` | 级别与格式、脱敏字段；OTLP 端点（traces）、头采样率（生产 chart 设 0.1）、`attribute_value_length_limit`（span 属性截断） |
-| `postgres` / `redis` / `cache` | 池参数、`statement_timeout`、`idle_in_transaction_timeout`、`slow_query_threshold` / `slow_query_log_rate`（慢 SQL 日志，只记语句不记实参）；Redis 单节点 `addr` 或 Sentinel / Cluster 的 `addrs`（+ `master_name`）二选一、短超时、`key_prefix` 必填；L2/L1 TTL、`load_timeout`（冷 key 回源的独立预算） |
+| `postgres` / `redis` / `cache` | 池参数、`statement_timeout`、`idle_in_transaction_timeout`、`slow_query_threshold` / `slow_query_log_rate`（慢 SQL 日志，只记语句不记实参）；Redis 单节点 `addr` 或 Sentinel / Cluster 的 `addrs`（+ `master_name`）二选一、短超时、`key_prefix` 必填；共享缓存（Redis）的 `default_ttl`、`load_timeout`（冷 key 回源的独立预算）；本地缓存不在这一节，`cache.NewLocal` 的 TTL 跟着数据写在代码里 |
 | `rabbitmq` / `outbox` | 交换机、quorum 队列、prefetch/并发、重试梯队、confirms、`publish_timeout`（一次发布的总时限）、`drain_timeout`（消费者排空）；投递器轮询/批量、被拒消息的退避（`retry_base_delay` → `retry_max_delay`）、分批清理（`outbox` 段两个 broker 的投递器共用） |
 | `kafka` | 默认关。`events`（走 Kafka 的事件名：发布与消费都在 Kafka，其余事件留在 RabbitMQ；只在 `enabled` 时可非空、不得重复、须是合法 topic 名）、`consumers_enabled`、`brokers`、`tls`、`sasl.mechanism` / `username`（密码只从 Secret 的 `KAFKA__SASL__PASSWORD` 来）、`topics`（事件 → topic 覆盖）、`retry_delays`（`{group}.retry.N` 梯队）、`publish_timeout`、`drain_timeout`、`ping_interval`、`consume_from`（新 group 的起点，默认 `earliest`）、`create_topics`、`topic_partitions` / `topic_replication_factor`（-1 = broker 默认）、`max_poll_records` |
 | `tasks` | `max_workers`（0 = kill switch）、attempts 预算与失败退避（`retry_base_delay` → `retry_max_delay`）、`task_timeout < stale_after`、`recurring.*` / `cron.*` 覆盖、`queues.<q>.*` 按队列覆盖（含 `task_timeout`，同样须小于 `stale_after`） |
@@ -131,17 +131,18 @@ deploy/kind/kind-smoke.sh   # K8s 冒烟：kind + 依赖 + db/*.sql + helm insta
 | kit 分发 | 独立的私有模块 `github.com/guangliangus/go-msvc-kit`，按语义化版本依赖；kit 自己的表（outbox / inbox / task_queues）的 DDL 随 kit 发布，服务 `db/` 保留逐字节副本、守卫比对 | Go 的正解是**版本化的共享模块**：平台契约在一处演进，服务按版本升级，不再每个服务各持一份会漂移的副本。代价是私有模块的访问要配三处（开发机 GOPRIVATE + gh、流水线 token、镜像构建 secret），kit 的改动要守发版纪律（tag 不可变、`gorelease` 查兼容性，见 kit README） |
 | 宿主形态 | 一个二进制 `serve` / `worker` 子命令，一个镜像 | 同一静态二进制靠子命令选形态，不需要两个工程；Helm 的 `worker.enabled=true` 自动给 API pod 注入 `TASKS__MAX_WORKERS=0`、`RABBITMQ__CONSUMERS_ENABLED=false` 与 `KAFKA__CONSUMERS_ENABLED=false` |
 | 路由 | chi v5 | 纯 `http.Handler`，中间件可组合、路由分组（按平面套 `RequireRealm`），`otelhttp` 直接兼容；不引 gin/echo 这类自有上下文的框架 |
-| 配置 | koanf + 内嵌 YAML + `SECTION__KEY` 环境变量 | 镜像自带默认值（无需挂文件）；`__` 作为层级分隔符让键名自己可以含 `_`（`TASKS__MAX_WORKERS`），也是平台服务 Helm values 的统一写法；禁止无 `__` 的变量混入 |
-| 数据访问 | pgx v5 原生 SQL + `RowToStructByName`，无 ORM、无 codegen | 团队规范是"DDL 手写是唯一真相"，ORM 的模型/迁移与之天然冲突；sqlc 是好选项但需要 cgo 工具链生成代码，暂不默认（known-open #8）。集成测试用 `db/*.sql` 建库，漂移在测试里暴露 |
-| 事务 | `db.WithTx(ctx, fn)`，事务挂在 ctx 上，仓储用 `db.Q(ctx)`；库外副作用用 `db.AfterCommit` | 业务行 + outbox 行 + 任务行一次提交，各包互不知晓；嵌套加入外层。`WithTxRetry` 只重试 40001/40P01，整段重跑。删缓存必须在提交之后，否则并发读会把旧行写回缓存 |
-| 乐观并发 | `xmin` | PostgreSQL 系统列，零 schema 改动、不会忘记自增；`UPDATE ... AND xmin = $n` 零行 → 409 `CONCURRENCY_CONFLICT`。要跨库可移植时换成显式 `version` 列 |
+| 配置 | koanf + 内嵌 JSONC + `SECTION__KEY` 环境变量 | 镜像自带默认值（无需挂文件）；JSONC 而不是 YAML：团队不用 YAML，标准 JSON 又不能写注释，而默认值要逐键说明为什么（hujson 把注释换成等长空白再按标准 JSON 解析，报错的行列号对得上原文件；同一文件重复的键报错，替换值靠 overlay）；`__` 作为层级分隔符让键名自己可以含 `_`（`TASKS__MAX_WORKERS`），也是平台服务 Helm values 的统一写法；禁止无 `__` 的变量混入 |
+| 数据访问 | GORM（`gorm.io/gorm` + `driver/postgres`），开在 kit 的 `db.SQL()` 上：同一个 pgx 连接池，连接池指标、慢 SQL 日志、`statement_timeout`、trace 都照常覆盖；`postgres.Gorm.On(ctx)` 把会话绑到 ctx 上的 `*sql.Tx`，业务行与 kit 的 outbox / inbox / 任务行同事务提交。`SkipDefaultTransaction`（事务只由 `db.WithTx` 开）、`QueryFields`（不生成 `SELECT *`）、永不 AutoMigrate；GORM 构造器表达不好的语句（`FOR UPDATE SKIP LOCKED` 子查询）用 `Raw` | 团队熟悉 GORM（平台现有 Go 服务在用），关联加载（`Preload`）、钩子（审计列）、动态条件写起来方便。为此 kit 的事务层改成了 `database/sql`（`TxFromContext` 返回 `*sql.Tx`），因为 GORM 只认 `database/sql`、加入不了 pgx 原生事务。代价：列名或映射写错到运行时（集成测试）才暴露，没有编译期检查；模型要和 `db/*.sql` 手工同步；Raw SQL 绕过钩子与乐观锁插件。sqlc 是更"编译期安全"的选项，评估后按团队习惯选了 GORM（known-open #8） |
+| 事务 | `db.WithTx(ctx, fn)`，事务（`*sql.Tx`）挂在 ctx 上，GORM 仓储用 `Gorm.On(ctx)`、kit 内部用 `db.Q(ctx)`；库外副作用用 `db.AfterCommit` | 业务行 + outbox 行 + 任务行一次提交，各包互不知晓；嵌套加入外层。`WithTxRetry` 只重试 40001/40P01，整段重跑。删缓存必须在提交之后，否则并发读会把旧行写回缓存 |
+| 缓存 | 两个独立缓存按数据选：订单用共享的 `cache.NewRedis`（只有 Redis），允许旧 N 秒的参考数据用 `cache.NewLocal[T]`（每个 pod 一份、自己的 TTL、没有 `Remove`）；不做两级缓存 | 两级缓存让每个调用方同时承担两种一致性：`Remove` 看似删干净，别的副本的进程内副本还会再给一个 local TTL 的旧值，而一个全局的 local TTL 对多数数据都不对。订单按客户读、没有热点 key，进程内一层命中率低、只带来跨副本的旧值；代价是每次命中一次 Redis 往返、Redis 挂时读全部回源（known-open #13），真有热点在调用处嵌套本地缓存。共享缓存提供单 key / 批量读穿、只读查看、发布与多 key 失效；失效留墓碑、回填 `SET NX`，挡住"提交前读旧行、失效后才回填"的旧值 |
+| 乐观并发 | 显式 `version integer` 列（`db/0002_orders_version.sql`）+ GORM 的 `optimisticlock` 插件：经模型 API 的更新自动带 `WHERE version = ?` 与 `SET version = version + 1`，零行 → 409 `CONCURRENCY_CONFLICT` | 系统列 `xmin` 零 schema 改动、任何写入都会改变它，但插件要的是普通列，而且 GORM 默认 `SELECT *` 读不出系统列。两个坑都有守卫：插件对版本号为 0 的对象**不加**条件（仓储直接拒绝这种更新，有测试）；Raw SQL 绕过插件（reaper 的 Raw UPDATE 自己自增，集成测试锁住"取消后拿旧版本号的写入必须冲突"） |
 | 日志 | `log/slog`，JSON 到 stdout；handler 包装器加 trace_id/span_id、脱敏 | 标准库，无第三方；与 OTel 的 trace id 同值 |
 | 指标通道 | /metrics Prometheus 抓取（OTel SDK + Prometheus exporter），traces 走 OTLP | 指标拉、trace 推，是 K8s 上最省事的分工；`otelhttp` 直接产出 OTel 语义约定的 `http_server_request_duration_seconds`；`msvc_messaging_*`、`msvc_tasks_*` 是平台指标名，一套看板/告警覆盖所有服务 |
 | 认证 | HS256 本地验签（`golang-jwt/v5`），`realm` 平面策略，开发请求头只认 `APP_ENV=development`；验证端可同时认多把密钥 | 与 user-svc 的现状一致；多把密钥让轮换不需要全平台同时切换（令牌格式不变）；OIDC 留给 B2B 签发方（known-open #4） |
 | 错误契约 | handler 返回 `error`，`httpx.ErrorWriter` 统一写 RFC 9457 | 一处决定状态码、`errorCode`、`traceId`、`Retry-After`、`WWW-Authenticate`；路由器 404/405 同形；服务自己的异常类型用 `Mappers` 接入，本地化用 `Customizers` |
 | 校验边界 | 请求的**形状**归 `httpapi` 的 struct tag：400 `VALIDATION_FAILED`，逐字段列在 `errors` 里；业务**规则**归上下文包：422 带它自己的码（`order.CheckLines`、`order.New`） | 形状错了业务代码一行都不跑，所有字段错误一次报完；规则只在一处（`order.MaxItems` 是条数上限的唯一来源，tag 里故意不复制），消费者和任务绕过 tag 也受同一套规则约束。分页参数同理：不是整数 400 并点名参数，越界的数字夹到边界（`page` > 10000 拒绝） |
 | 守卫 | `tests/arch/deps_test.go` 表驱动（上下文 / 适配器 / 入口 / 组合根四张名单，目录不存在或 `go list` 匹配到零个包都算失败）；`internal/httpapi/openapi_test.go` 把路由和 `api/openapi.yaml` 双向比对；`tests/arch/kitddl_test.go` 把 `db/kit_*.sql` 和 kit 内嵌的脚本逐字节比对 | 守卫最常见的失效方式是"检查了零个东西还报绿"，所以零匹配是错误；改名一个目录必须改表，否则测试红。文档漂移只能抓路径层面，schema 仍靠人（known-open #5） |
-| HTTP 幂等 | `Idempotency-Key` + Redis `SET NX GET`，fail-closed 503 | IETF `Idempotency-Key` 草案的语义：成功重放、并发 409、错误不缓存；存储不可达时放行等于删除保证 |
+| 幂等 | 由业务在数据库里做：下单把 `Idempotency-Key` 存为 `orders.request_id`，`(customer_id, request_id)` 部分唯一索引与订单行、outbox 行同一事务提交；重复请求答 200 和已有订单，同一个 key 换了商品答 422 `ORDER_REQUEST_ID_REUSED`；没有通用中间件 | 什么算重复只有业务知道；去重记录必须和业务数据同一事务，否则"库提交了、去重记录没写"的窗口会让重试再执行一次。按「调用方 + 路径 + key」在 Redis 里快照响应的中间件猜不对重复（不看请求体）、不在事务里、还和缓存共用 Redis 的容量与淘汰策略，已从 kit 删除（`docs/architecture.md`「幂等由业务在数据库里做」） |
 | 限流 | `httprate` 本地滑动窗口，`caller\|ip\|none` 分桶，拿不到地址不计数 | per-pod 语义写进文档；跨副本的业务限流用 `redisx.FixedWindowAllow`（一段 Lua、fail-open） |
 | 弹性 | HTTP 客户端：breaker → retry（只幂等方法 / 带 Idempotency-Key）→ 透传 token → otelhttp；非 HTTP：`resilience.Retry` + 调用方给的分类器 | 价值在分类而不是次数：`postgres.IsTransient` 不把 23505 当瞬态；熔断默认只在单个下游前（共享资源前的熔断会把局部故障放大成全局） |
 | 消息 | 官方 amqp091-go + 自写重连；拓扑/头/指标按平台线格式；outbox（SKIP LOCKED）+ inbox（事务内） | 官方客户端没有自动恢复，`rabbitmq.Connection` 补上；不引 watermill 等框架以保持线格式可控。队列名 `{service}.{event}` 与宿主形态无关，API 与 worker 是同一队列的竞争消费者 |
@@ -150,7 +151,7 @@ deploy/kind/kind-smoke.sh   # K8s 冒烟：kind + 依赖 + db/*.sql + helm insta
 | 优雅停机 | `lifecycle.Group` 反序停止：API 先停（readiness 变 503，在途请求最多 `drain_timeout`）→ 任务 runner 排空 → 消费者停收、排空后再取消 → outbox → 连接（每个 bus 一组，Kafka 的先停）→ admin 最后停 | grace period 从 preStop 之前开始计时，chart 设 50s = preStop 5 + 预算 30 + flush 5 + 余量；API 只拿预算的一部分，后面的组件不会被饿死；关连接池有上限 |
 | 架构守卫 | `tests/arch`（`go list` 直接 import）+ kit 的 `ddlguard`（服务侧一行 `ddlguard.Check(t, "../../db")`）+ depguard（`order-stays-pure` 覆盖 `internal/` 下除组合根与适配器之外的一切） | 靠人记住的约束平均被违反两次以上才有人写下来；守卫让违规在 `go test` 时红。DDL 规则放进 kit，每个服务跑同一套而不是各抄一份 |
 | 镜像 | 多阶段：`golang:1.27-alpine` 编译静态二进制 → `distroless/static:nonroot`，都按 digest 固定 | 无 shell、非 root、只读根文件系统（chart 打开）；镜像约 20 MB；tag 是会移动的指针，digest 让同一提交重建出同一镜像，Renovate 以 PR 形式升级 |
-| 测试基础设施 | testify 不是必需：标准 `testing` + `httptest` + miniredis（单测）+ Testcontainers（集成） | 单测不需要 Docker 也能覆盖中间件、幂等、缓存、认证、handler；真依赖的行为（SKIP LOCKED、xmin、SET NX GET、TTL 梯队）只在容器里验 |
+| 测试基础设施 | testify 不是必需：标准 `testing` + `httptest` + miniredis（单测）+ Testcontainers（集成） | 单测不需要 Docker 也能覆盖中间件、幂等、缓存、认证、handler；真依赖的行为（SKIP LOCKED、version 乐观并发、SET NX GET、TTL 梯队）只在容器里验 |
 | 平台请求头 | 入站由 `PlatformHeaders` 捕获，下游调用自动带 `X-Service-Name` 并透传 `X-Request-ID`、`X-Language`；`http.required_headers` 按平面要求必带头 | 平台现有服务的内部路由要求这三个头，缺了直接 400；放进 kit 后每个 handler 都不用记。入站没有 X-Request-ID 时用 trace id 顶上，两边日志对得上 |
 | 错误文案本地化 | kit 的 `i18n`：按 errorCode 的多语言目录，`X-Language` / `Accept-Language` 协商，写进 RFC 9457 的 `title`；守卫测试保证每个码每种语言都有文案 | title 是"按类型"的摘要，正好一码一句，detail 留给开发者。kit 带平台码的 en / zh-CN / zh-TW / ja，服务只补自己的码 |
 | 数据库可观测 | pgxpool 指标（`pgxpool_*`）+ 慢 SQL 日志（只记语句不记实参、截断 2000 字节、每秒限速、被限速的也计数） | 池满和慢查询是两种故障，各要有自己的信号。慢 SQL 的 elapsed 不含等连接的时间，排队看 `pgxpool_empty_acquire_total` |
@@ -169,8 +170,8 @@ deploy/kind/kind-smoke.sh   # K8s 冒烟：kind + 依赖 + db/*.sql + helm insta
 ## 常见运维问答
 
 - **DDL 在哪跑？** 手动执行 `db/*.sql`（先 DDL、后发代码，脚本幂等且向后兼容）；compose/kind 冒烟里由 `schema` 一次性服务代跑。应用启动永不改库。
-- **客户端超时重试 POST 会重复下单吗？** 带 `Idempotency-Key` 就不会：成功响应被快照重放（`Idempotency-Replayed: true`），同 key 并发得 409，错误响应不缓存、可重试。
-- **两个副本同时改同一行？** 后写的 `UPDATE` 匹配不到 `xmin` → 409 `CONCURRENCY_CONFLICT`，客户端重读重试。
+- **客户端超时重试 POST 会重复下单吗？** 带 `Idempotency-Key` 就不会：同一个客户、同一个 key 只有一张订单（数据库唯一索引，和订单、事件同一事务），重复的请求答 200 和那张订单，并发的重复也一样；换了商品答 422。别的写要幂等，照下单的形状在自己的表里做。
+- **两个副本同时改同一行？** 后写的 `UPDATE` 匹配不到 `version` → 409 `CONCURRENCY_CONFLICT`，客户端重读重试。
 - **DLQ 里的消息怎么处理？** `{queue}.dlq` 手工检视（管理台）：`x-exception` 带失败原因，`x-dead-letter-reason`（exhausted / non_retryable）、`x-failed-at`、`x-origin-queue` 说明为什么、何时、从哪个队列来，AMQP `app-id` 是发布它的服务；修复后用 `tools/dlq-replay.sh <queue>` 批量回放（重置重试计数）。回放中途失败的那条已经不在 DLQ 里，脚本会把它完整写到 stderr 和 `./dlq-replay-failed-<queue>-<ts>.json` 再停下，照着文件手动重发。Kafka 的死信在 `{group}.dlq` topic，头相同、另带 `x-origin-topic`；脚本只管 RabbitMQ，Kafka 的回放见 known-open #9。
 - **API pod 和 worker pod 都在消费？** 它们是同一队列（`{service}.{event}`；Kafka 上是同名 consumer group）的竞争消费者，每条消息只被处理一次；想让 API pod 完全不消费，设 `RABBITMQ__CONSUMERS_ENABLED=false` / `KAFKA__CONSUMERS_ENABLED=false`（chart 在 `worker.enabled=true` 时自动设置）。
 - **Redis / RabbitMQ / Kafka 挂了，pod 为什么还是 Ready？** 有意的：它们是所有副本共享的依赖，摘流量会让降级变成全量 503。看 `DependencyUnavailable` 告警和 admin 端口 `/health/ready` 的报告（`Degraded`，对应项 `"gating": false`）。只有 PostgreSQL 会让 pod NotReady。

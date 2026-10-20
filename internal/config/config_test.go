@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// What a production deployment supplies from Secrets and the config map; default.yaml carries
+// What a production deployment supplies from Secrets and the config map; default.jsonc carries
 // none of it on purpose.
 var productionEnv = []string{
 	"POSTGRES__DSN=postgres://u:p@db:5432/x",
@@ -39,7 +39,7 @@ func TestEmbeddedDefaultsValidate(t *testing.T) {
 	}
 }
 
-// default.yaml is the production baseline, so it must not carry a localhost anything: a pod
+// default.jsonc is the production baseline, so it must not carry a localhost anything: a pod
 // whose Secret was forgotten refuses to boot instead of starting against a database that is
 // not there.
 func TestProductionRefusesToBootWithoutItsConnections(t *testing.T) {

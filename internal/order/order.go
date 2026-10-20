@@ -39,6 +39,8 @@ const (
 	CodeNotPending      = "ORDER_NOT_PENDING"
 	CodeNotCancellable  = "ORDER_NOT_CANCELLABLE"
 	CodeTotalTooLarge   = "ORDER_TOTAL_TOO_LARGE"
+	// CodeRequestIDReused is an Idempotency-Key the customer already used for a different basket.
+	CodeRequestIDReused = "ORDER_REQUEST_ID_REUSED"
 )
 
 // MaxItems bounds the lines one order may carry. It is a rule of the order, not of the wire format:
@@ -105,9 +107,13 @@ type Order struct {
 	CreatedBy   string
 	UpdatedAt   time.Time
 	UpdatedBy   string
-	// Version is the row's xmin, the optimistic concurrency token: an update that carries a
-	// stale one affects zero rows and surfaces as 409 CONCURRENCY_CONFLICT.
-	Version uint32
+	// RequestID is the client's id for the request that created the order (its Idempotency-Key),
+	// unique per customer; "" when the request carried none.
+	RequestID string
+	// Version is the optimistic concurrency token (the orders.version column, bumped by every
+	// update): an update that carries a stale one affects zero rows and surfaces as 409
+	// CONCURRENCY_CONFLICT.
+	Version int
 }
 
 // New validates the invariants and builds a PENDING order from priced items: the line rules
@@ -146,6 +152,20 @@ func newChecked(customerID string, items []Item) (*Order, error) {
 	}, nil
 }
 
+// createdFrom reports whether the order was created from exactly these lines, in this order: what
+// a repeated request must ask for to be answered with this order.
+func (o *Order) createdFrom(lines []Line) bool {
+	if len(o.Items) != len(lines) {
+		return false
+	}
+	for i, l := range lines {
+		if o.Items[i].SKU != l.SKU || o.Items[i].Quantity != l.Quantity {
+			return false
+		}
+	}
+	return true
+}
+
 // Confirm moves a PENDING order to CONFIRMED.
 func (o *Order) Confirm() error {
 	if o.Status != StatusPending {
@@ -170,5 +190,5 @@ func (o *Order) Cancel() error {
 // API document complete.
 func Codes() []string {
 	return []string{CodeItemsRequired, CodeItemInvalid, CodeItemUnavailable, CodeNotPending, CodeNotCancellable,
-		CodeTotalTooLarge}
+		CodeTotalTooLarge, CodeRequestIDReused}
 }

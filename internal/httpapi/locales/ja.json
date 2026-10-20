@@ -4,5 +4,6 @@
   "ORDER_ITEM_UNAVAILABLE": "商品の在庫が不足しています",
   "ORDER_NOT_PENDING": "注文の状態が変更されました",
   "ORDER_NOT_CANCELLABLE": "この注文はキャンセルできません",
-  "ORDER_TOTAL_TOO_LARGE": "注文金額が上限を超えています。注文を分けてください"
+  "ORDER_TOTAL_TOO_LARGE": "注文金額が上限を超えています。注文を分けてください",
+  "ORDER_REQUEST_ID_REUSED": "このリクエストキーは別の注文に使用済みです"
 }
